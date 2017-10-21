@@ -39,7 +39,7 @@ See the `tutorial <http://www.zipline-live.io/tutorial>`_ and `features <http://
 
 I made several enhancement to zipline-live:
 
-1. Add csvdir to data bundle.
+1. Add csvdir to data bundle which could ingest csv files as data sources.
 
 2. Decouple data feed from broker.
 
