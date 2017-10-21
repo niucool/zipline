@@ -37,14 +37,14 @@ See the `tutorial <http://www.zipline-live.io/tutorial>`_ and `features <http://
 
 .. _`Zipline Install Documentation` : http://www.zipline.io/install.html
 
-**I made several enhancement to zipline-live:**
+Several enhancement to zipline-live:
 =============
 
-1. Add csvdir to data bundle which could ingest csv files as data sources.
+1. Add csvdir.py to data bundle which could ingest csv files.
 
 2. Decouple data feed from broker, two data feeds are supported now:
-    * IB data subscription
-    * `Alpha Vantage <https://www.alphavantage.co/documentation/>`_ real time api
+    A. IB data subscription
+    B. `Alpha Vantage <https://www.alphavantage.co/documentation/>`_ real time API
 
 3. Some minor improvements for easy to use.
 
