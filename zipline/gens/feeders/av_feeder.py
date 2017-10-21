@@ -108,10 +108,6 @@ class AVFeeder(Feeder):
             # self._assets_cache[symbol][data_frequency]['data'] = None
             pass
 
-    @property
-    def time_skew(self):
-        return self._tws.time_skew
-
     def get_spot_value(self, assets, field, dt, data_frequency):
         symbol = str(assets.symbol)
         self.subscribe_to_market_data(assets, data_frequency)
