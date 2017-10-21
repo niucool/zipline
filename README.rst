@@ -37,7 +37,7 @@ See the `tutorial <http://www.zipline-live.io/tutorial>`_ and `features <http://
 
 .. _`Zipline Install Documentation` : http://www.zipline.io/install.html
 
-I made several enhancement to zipline-live:
+**I made several enhancement to zipline-live:**
 
 1. Add csvdir to data bundle which could ingest csv files as data sources.
 
