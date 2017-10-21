@@ -42,6 +42,7 @@ class LiveAlgorithmExecutor(AlgorithmSimulator):
 class LiveTradingAlgorithm(TradingAlgorithm):
     def __init__(self, *args, **kwargs):
         self.broker = kwargs.pop('broker', None)
+        self.feeder = kwargs.pop('feeder', None)
         self.orders = {}
 
         self.algo_filename = kwargs.get('algo_filename', "<algorithm>")
@@ -113,7 +114,7 @@ class LiveTradingAlgorithm(TradingAlgorithm):
             execution_closes,
             before_trading_start_minutes,
             minute_emission=minutely_emission,
-            time_skew=self.broker.time_skew
+            time_skew=self.feeder.time_skew
         )
 
     def _create_generator(self, sim_params):
@@ -234,8 +235,8 @@ class LiveTradingAlgorithm(TradingAlgorithm):
             self.realtime_bar_target))
 
         today = str(pd.to_datetime('today').date())
-        subscribed_assets = self.broker.subscribed_assets
-        realtime_history = self.broker.get_realtime_bars(subscribed_assets,
+        subscribed_assets = self.feeder.subscribed_assets
+        realtime_history = self.feeder.get_realtime_bars(subscribed_assets,
                                                          '1m')
 
         if not os.path.exists(self.realtime_bar_target):

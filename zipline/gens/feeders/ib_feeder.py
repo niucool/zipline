@@ -20,13 +20,7 @@ from six import itervalues
 import pandas as pd
 import numpy as np
 
-from zipline.gens.brokers.broker import Broker
-from zipline.finance.order import (Order as ZPOrder,
-                                   ORDER_STATUS as ZP_ORDER_STATUS)
-from zipline.finance.execution import (MarketOrder,
-                                       LimitOrder,
-                                       StopOrder,
-                                       StopLimitOrder)
+from zipline.gens.feeders.feeder import Feeder
 import zipline.protocol as zp
 from zipline.api import symbol as symbol_lookup
 from zipline.errors import SymbolNotFound
@@ -34,7 +28,6 @@ from zipline.errors import SymbolNotFound
 from ib.ext.EClientSocket import EClientSocket
 from ib.ext.EWrapper import EWrapper
 from ib.ext.Contract import Contract
-from ib.ext.Order import Order
 from ib.ext.EClientErrors import EClientErrors
 
 from logbook import Logger
@@ -42,12 +35,7 @@ from logbook import Logger
 if sys.version_info > (3,):
     long = int
 
-log = Logger('IB Broker')
-
-Position = namedtuple('Position', ['contract', 'position', 'market_price',
-                                   'market_value', 'average_cost',
-                                   'unrealized_pnl', 'realized_pnl',
-                                   'account_name'])
+log = Logger('IB Feeder')
 
 
 def log_message(message, mapping):
@@ -63,7 +51,7 @@ def log_message(message, mapping):
 
 
 class TWSConnection(EClientSocket, EWrapper):
-    def __init__(self, tws_uri, order_update_callback):
+    def __init__(self, tws_uri):
         EWrapper.__init__(self)
         EClientSocket.__init__(self, anyWrapper=self)
 
@@ -72,22 +60,13 @@ class TWSConnection(EClientSocket, EWrapper):
         self._host = host
         self._port = int(port)
         self._client_id = int(client_id)
-        self._order_update_callback = order_update_callback
 
         self._next_ticker_id = 0
-        self._next_order_id = None
         self.managed_accounts = None
         self.symbol_to_ticker_id = {}
         self.ticker_id_to_symbol = {}
         self.last_tick = defaultdict(dict)
         self.bars = {}
-        # accounts structure: accounts[account_id][currency][value]
-        self.accounts = defaultdict(
-            lambda: defaultdict(lambda: defaultdict(lambda: np.NaN)))
-        self.accounts_download_complete = False
-        self.positions = {}
-        self.portfolio = {}
-        self.orders = {}
         self.time_skew = None
 
         self.connect()
@@ -99,38 +78,19 @@ class TWSConnection(EClientSocket, EWrapper):
         while self.notConnected():
             sleep(0.1)
 
-        self._download_account_details()
-        log.info("Managed accounts: {}".format(self.managed_accounts))
-
         self.reqCurrentTime()
         self.reqIds(1)
 
-        while self.time_skew is None or self._next_order_id is None:
+        while self.time_skew is None:
             sleep(0.1)
 
         log.info("Local-Broker Time Skew: {}".format(self.time_skew))
-
-    def _download_account_details(self):
-        self.reqManagedAccts()
-        while self.managed_accounts is None:
-            sleep(0.1)
-
-        for account in self.managed_accounts:
-            self.reqAccountUpdates(subscribe=True, acctCode=account)
-        while self.accounts_download_complete is False:
-            sleep(0.1)
 
     @property
     def next_ticker_id(self):
         ticker_id = self._next_ticker_id
         self._next_ticker_id += 1
         return ticker_id
-
-    @property
-    def next_order_id(self):
-        order_id = self._next_order_id
-        self._next_order_id += 1
-        return order_id
 
     def subscribe_to_market_data(self,
                                  symbol,
@@ -220,52 +180,6 @@ class TWSConnection(EClientSocket, EWrapper):
                 future_expiry, dividend_impact, dividends_to_expiry):
         log_message('tickEFP', vars())
 
-    def orderStatus(self, order_id, status, filled, remaining, avg_fill_price,
-                    perm_id, parent_id, last_fill_price, client_id, why_held):
-        log_message('orderStatus', vars())
-
-        self._order_update_callback(order_id, status, int(filled))
-
-    def openOrder(self, order_id, contract, order, state):
-        log_message('openOrder', vars())
-
-    def openOrderEnd(self):
-        log_message('openOrderEnd', vars())
-
-    def updateAccountValue(self, key, value, currency, account_name):
-        self.accounts[account_name][currency][key] = value
-
-    def updatePortfolio(self,
-                        contract,
-                        position,
-                        market_price,
-                        market_value,
-                        average_cost,
-                        unrealized_pnl,
-                        realized_pnl,
-                        account_name):
-        symbol = contract.m_symbol
-
-        position = Position(contract=contract,
-                            position=position,
-                            market_price=market_price,
-                            market_value=market_value,
-                            average_cost=average_cost,
-                            unrealized_pnl=unrealized_pnl,
-                            realized_pnl=realized_pnl,
-                            account_name=account_name)
-
-        self.positions[symbol] = position
-
-    def updateAccountTime(self, time_stamp):
-        pass
-
-    def accountDownloadEnd(self, account_name):
-        self.accounts_download_complete = True
-
-    def nextValidId(self, order_id):
-        self._next_order_id = order_id
-
     def contractDetails(self, req_id, contract_details):
         log_message('contractDetails', vars())
 
@@ -351,12 +265,6 @@ class TWSConnection(EClientSocket, EWrapper):
     def tickSnapshotEnd(self, req_id):
         log_message('tickSnapshotEnd', vars())
 
-    def position(self, account, contract, pos, avg_cost):
-        log_message('position', vars())
-
-    def positionEnd(self):
-        log_message('positionEnd', vars())
-
     def accountSummary(self, req_id, account, tag, value, currency):
         log_message('accountSummary', vars())
 
@@ -364,14 +272,11 @@ class TWSConnection(EClientSocket, EWrapper):
         log_message('accountSummaryEnd', vars())
 
 
-class IBBroker(Broker):
+class IBFeeder(Feeder):
     def __init__(self, tws_uri, account_id=None):
         self._tws_uri = tws_uri
-        self.orders = {}
 
-        self._tws = TWSConnection(tws_uri, self._order_update)
-        self.account_id = (self._tws.managed_accounts[0] if account_id is None
-                           else self._tws.managed_accounts[0])
+        self._tws = TWSConnection(tws_uri)
         self.currency = 'USD'
 
         self._subscribed_assets = []
@@ -392,173 +297,8 @@ class IBBroker(Broker):
                 sleep(0.1)
 
     @property
-    def positions(self):
-        z_positions = zp.Positions()
-        for symbol in self._tws.positions:
-            ib_position = self._tws.positions[symbol]
-            try:
-                z_position = zp.Position(symbol_lookup(symbol))
-            except SymbolNotFound:
-                # The symbol might not have been ingested to the db therefore
-                # it needs to be skipped.
-                continue
-            z_position.amount = int(ib_position.position)
-            z_position.cost_basis = float(ib_position.average_cost)
-            z_position.last_sale_price = None  # TODO(tibor): Fill from state
-            z_position.last_sale_date = None  # TODO(tibor): Fill from state
-            z_positions[symbol_lookup(symbol)] = z_position
-
-        return z_positions
-
-    @property
-    def portfolio(self):
-        ib_account = self._tws.accounts[self.account_id][self.currency]
-
-        z_portfolio = zp.Portfolio()
-        z_portfolio.capital_used = None  # TODO(tibor)
-        z_portfolio.starting_cash = None  # TODO(tibor): Fill from state
-        z_portfolio.portfolio_value = float(ib_account['EquityWithLoanValue'])
-        z_portfolio.pnl = (float(ib_account['RealizedPnL']) +
-                           float(ib_account['UnrealizedPnL']))
-        z_portfolio.returns = None  # TODO(tibor): pnl / total_at_start
-        z_portfolio.cash = float(ib_account['TotalCashValue'])
-        z_portfolio.start_date = None  # TODO(tibor)
-        z_portfolio.positions = self.positions
-        z_portfolio.positions_value = None  # TODO(tibor)
-        z_portfolio.positions_exposure = None  # TODO(tibor)
-
-        return z_portfolio
-
-    @property
-    def account(self):
-        ib_account = self._tws.accounts[self.account_id][self.currency]
-
-        z_account = zp.Account()
-
-        z_account.settled_cash = None  # TODO(tibor)
-        z_account.accrued_interest = None  # TODO(tibor)
-        z_account.buying_power = float(ib_account['BuyingPower'])
-        z_account.equity_with_loan = float(ib_account['EquityWithLoanValue'])
-        z_account.total_positions_value = None  # TODO(tibor)
-        z_account.total_positions_exposure = None  # TODO(tibor)
-        z_account.regt_equity = float(ib_account['RegTEquity'])
-        z_account.regt_margin = float(ib_account['RegTMargin'])
-        z_account.initial_margin_requirement = float(
-            ib_account['FullInitMarginReq'])
-        z_account.maintenance_margin_requirement = float(
-            ib_account['FullMaintMarginReq'])
-        z_account.available_funds = None  # TODO(tibor)
-        z_account.excess_liquidity = float(ib_account['ExcessLiquidity'])
-        z_account.cushion = float(
-            self._tws.accounts[self.account_id]['']['Cushion'])
-        z_account.day_trades_remaining = float(
-            self._tws.accounts[self.account_id]['']['DayTradesRemaining'])
-        z_account.leverage = float(
-            self._tws.accounts[self.account_id]['']['Leverage-S'])
-        z_account.net_leverage = None  # TODO(tibor)
-        z_account.net_liquidation = float(ib_account['NetLiquidation'])
-
-        return z_account
-
-    @property
     def time_skew(self):
         return self._tws.time_skew
-
-    def order(self, asset, amount, limit_price, stop_price, style):
-        is_buy = (amount > 0)
-        zp_order = ZPOrder(
-            dt=pd.to_datetime('now', utc=True),
-            asset=asset,
-            amount=amount,
-            stop=style.get_stop_price(is_buy),
-            limit=style.get_limit_price(is_buy))
-
-        contract = Contract()
-        contract.m_symbol = str(asset.symbol)
-        contract.m_currency = self.currency
-        contract.m_exchange = 'SMART'
-        contract.m_secType = 'STK'
-
-        order = Order()
-        order.m_totalQuantity = int(fabs(amount))
-        order.m_action = "BUY" if amount > 0 else "SELL"
-
-        order.m_lmtPrice = 0
-        order.m_auxPrice = 0
-
-        if isinstance(style, MarketOrder):
-            order.m_orderType = "MKT"
-        elif isinstance(style, LimitOrder):
-            order.m_orderType = "LMT"
-            order.m_lmtPrice = limit_price
-        elif isinstance(style, StopOrder):
-            order.m_orderType = "STP"
-            order.m_auxPrice = stop_price
-        elif isinstance(style, StopLimitOrder):
-            order.m_orderType = "STP LMT"
-            order.m_auxPrice = stop_price
-            order.m_lmtPrice = limit_price
-
-        order.m_tif = "DAY"
-
-        ib_order_id = self._tws.next_order_id
-        zp_order.broker_order_id = ib_order_id
-        self.orders[zp_order.id] = zp_order
-
-        self._tws.placeOrder(ib_order_id, contract, order)
-
-        return zp_order.id
-
-    def get_open_orders(self, asset):
-        if asset is None:
-            assets = set([order.asset for order in itervalues(self.orders)
-                          if order.open])
-            return {
-                asset: [order.to_api_obj() for order in itervalues(self.orders)
-                        if order.asset == asset]
-                for asset in assets
-            }
-        return [order.to_api_obj() for order in itervalues(self.orders)
-                if order.asset == asset and order.open]
-
-    def get_order(self, zp_order_id):
-        return self.orders[zp_order_id].to_api_obj()
-
-    def cancel_order(self, zp_order_id):
-        ib_order_id = self.orders[zp_order_id].broker_order_id
-        # ZPOrder cancellation will be done indirectly through _order_update
-        self._tws.cancelOrder(ib_order_id)
-
-    def _get_zp_order_id(self, ib_order_id):
-        ib_order_ids = [e for e in self.orders
-                        if self.orders[e].broker_order_id == ib_order_id]
-        if len(ib_order_ids) == 0:
-            return None
-        elif len(ib_order_ids) == 1:
-            return ib_order_ids[0]
-        else:
-            raise RuntimeError("More than one order found for id: %s" %
-                               ib_order_id)
-
-    def _order_update(self, ib_order_id, status, filled):
-        # TWS can report orders which has not been registered in the current
-        # session: If the app crashed and restarted (with the same client_id)
-        # the orders fired prior to the crash is reported on restart.
-        # Those order updates will be ignored by us.
-        zp_order_id = self._get_zp_order_id(ib_order_id)
-        if zp_order_id is None:
-            return
-
-        if status.lower() == 'submitted':
-            self.orders[zp_order_id].status = ZP_ORDER_STATUS.OPEN
-        elif status.lower() == 'cancelled':
-            self.orders[zp_order_id].status = ZP_ORDER_STATUS.CANCELLED
-        elif status.lower() == 'filled':
-            self.orders[zp_order_id].status = ZP_ORDER_STATUS.FILLED
-
-        self.orders[zp_order_id].filled = filled
-
-        # TODO: Add commission if the order is executed
 
     def get_spot_value(self, assets, field, dt, data_frequency):
         symbol = str(assets.symbol)

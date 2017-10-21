@@ -72,6 +72,7 @@ def _run(handle_data,
          local_namespace,
          environ,
          broker,
+         feeder,
          state_filename,
          realtime_bar_target):
     """Run a backtest for the given algorithm.
@@ -143,8 +144,8 @@ def _run(handle_data,
         first_trading_day =\
             bundle_data.equity_minute_bar_reader.first_trading_day
 
-        DataPortalClass = (partial(DataPortalLive, broker)
-                           if broker
+        DataPortalClass = (partial(DataPortalLive, feeder)
+                           if feeder
                            else DataPortal)
         data = DataPortalClass(
             env.asset_finder, get_calendar("NYSE"),
@@ -177,21 +178,26 @@ def _run(handle_data,
 
     TradingAlgorithmClass = (partial(LiveTradingAlgorithm,
                                      broker=broker,
+                                     feeder=feeder,
                                      state_filename=state_filename,
                                      realtime_bar_target=realtime_bar_target)
                              if broker else TradingAlgorithm)
+
+    sim_params = create_simulation_parameters(
+        start=start,
+        end=end,
+        capital_base=capital_base,
+        emission_rate=emission_rate,
+        data_frequency=data_frequency,
+    )
+    if broker:
+        sim_params.arena = 'IB'
 
     perf = TradingAlgorithmClass(
         namespace=namespace,
         env=env,
         get_pipeline_loader=choose_loader,
-        sim_params=create_simulation_parameters(
-            start=start,
-            end=end,
-            capital_base=capital_base,
-            emission_rate=emission_rate,
-            data_frequency=data_frequency,
-        ),
+        sim_params=sim_params,
         **{
             'initialize': initialize,
             'handle_data': handle_data,
@@ -282,8 +288,10 @@ def run_algorithm(start,
                   extensions=(),
                   strict_extensions=True,
                   environ=os.environ,
-                  live_trading=False,
-                  tws_uri=None):
+                  broker=None,
+                  feeder=None,
+                  state_filename=None,
+                  realtime_bar_target=None):
     """Run a trading algorithm.
 
     Parameters
@@ -387,7 +395,8 @@ def run_algorithm(start,
         print_algo=False,
         local_namespace=False,
         environ=environ,
-        broker=None,
-        state_filename=None,
-        realtime_bar_target=None
+        broker=broker,
+        feeder=feeder,
+        state_filename=state_filename,
+        realtime_bar_target=realtime_bar_target
     )

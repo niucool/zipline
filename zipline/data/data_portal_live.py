@@ -19,15 +19,15 @@ log = Logger('DataPortalLive')
 
 
 class DataPortalLive(DataPortal):
-    def __init__(self, broker, *args, **kwargs):
-        self.broker = broker
+    def __init__(self, feeder, *args, **kwargs):
+        self.feeder = feeder
         super(DataPortalLive, self).__init__(*args, **kwargs)
 
     def get_last_traded_dt(self, asset, dt, data_frequency):
-        return self.broker.get_last_traded_dt(asset)
+        return self.feeder.get_last_traded_dt(asset)
 
     def get_spot_value(self, assets, field, dt, data_frequency):
-        return self.broker.get_spot_value(assets, field, dt, data_frequency)
+        return self.feeder.get_spot_value(assets, field, dt, data_frequency)
 
     def get_history_window(self,
                            assets,
@@ -38,7 +38,7 @@ class DataPortalLive(DataPortal):
                            data_frequency,
                            ffill=True):
         # This method is responsible for merging the ingested historical data
-        # with the real-time collected data through the Broker.
+        # with the real-time collected data through the feeder.
         # DataPortal.get_history_window() is called with ffill=False to mark
         # the missing fields with NaNs. After merge on the historical and
         # real-time data the missing values (NaNs) are filled based on their
@@ -47,16 +47,16 @@ class DataPortalLive(DataPortal):
         # Warning: setting ffill=True in DataPortal.get_history_window() call
         # results a wrong behavior: The last available value reported by
         # get_spot_value() will be used to fill the missing data - which is
-        # always representing the current spot price presented by Broker.
+        # always representing the current spot price presented by feeder.
 
         historical_bars = super(DataPortalLive, self).get_history_window(
             assets, end_dt, bar_count, frequency, field, data_frequency,
             ffill=False)
 
-        realtime_bars = self.broker.get_realtime_bars(
+        realtime_bars = self.feeder.get_realtime_bars(
             assets, frequency)
 
-        # Broker.get_realtime_history() returns the asset as level 0 column,
+        # feeder.get_realtime_history() returns the asset as level 0 column,
         # open, high, low, close, volume returned as level 1 columns.
         # To filter for field the levels needs to be swapped
         realtime_bars = realtime_bars.swaplevel(0, 1, axis=1)

@@ -9,9 +9,13 @@ import logbook
 import pandas as pd
 from six import text_type
 
+import pkgutil
+
 from zipline.data import bundles as bundles_module
 from zipline.utils.cli import Date, Timestamp
 from zipline.utils.run_algo import _run, load_extensions
+from zipline.gens import brokers
+from zipline.gens import feeders
 
 try:
     __IPYTHON__
@@ -199,6 +203,18 @@ def ipython_only(option):
     help='Connection to broker',
 )
 @click.option(
+    '--feeder',
+    default=None,
+    help='Feeder (ib or av)'
+)
+@click.option(
+    '--feeder-uri',
+    default=None,
+    metavar='FEEDER-URI',
+    show_default=True,
+    help='Connection to feeder(key if feeder is av)',
+)
+@click.option(
     '--state-file',
     default=None,
     metavar='FILENAME',
@@ -209,6 +225,16 @@ def ipython_only(option):
     default=None,
     metavar='DIRNAME',
     help='Directory where the realtime collected minutely bars are saved'
+)
+@click.option(
+    '--list-brokers',
+    is_flag=True,
+    help='Get list of available brokers'
+)
+@click.option(
+    '--list-feeders',
+    is_flag=True,
+    help='Get list of available feeders'
 )
 @click.pass_context
 def run(ctx,
@@ -226,10 +252,29 @@ def run(ctx,
         local_namespace,
         broker,
         broker_uri,
+        feeder,
+        feeder_uri,
         state_file,
-        realtime_bar_target):
+        realtime_bar_target,
+        list_brokers,
+        list_feeders):
     """Run a backtest for the given algorithm.
     """
+
+    if list_brokers:
+        click.echo("Supported brokers:")
+        for _, name, _ in pkgutil.iter_modules(brokers.__path__):
+            if name != 'broker':
+                click.echo(name)
+        return
+
+    if list_feeders:
+        click.echo("Supported feeders:")
+        for _, name, _ in pkgutil.iter_modules(feeders.__path__):
+            if name != 'feeder':
+                click.echo(name)
+        return
+
     # check that the start and end dates are passed correctly
     if not broker and start is None and end is None:
         # check both at the same time to avoid the case where a user
@@ -269,6 +314,22 @@ def run(ctx,
                      (cl_name, mod_name))
         brokerobj = bclass(broker_uri)
 
+    feederobj = None
+    if feeder:
+        mod_name = 'zipline.gens.feeders.%s_feeder' % feeder.lower()
+        try:
+            bmod = import_module(mod_name)
+        except ImportError:
+            ctx.fail("unsupported feeder: can't import module %s" % mod_name)
+
+        cl_name = '%sFeeder' % feeder.upper()
+        try:
+            bclass = getattr(bmod, cl_name)
+        except AttributeError:
+            ctx.fail("unsupported feeder: can't import class %s from %s" %
+                     (cl_name, mod_name))
+        feederobj = bclass(feeder_uri)
+
     if (algotext is not None) == (algofile is not None):
         ctx.fail(
             "must specify exactly one of '-f' / '--algofile' or"
@@ -295,6 +356,7 @@ def run(ctx,
         local_namespace=local_namespace,
         environ=os.environ,
         broker=brokerobj,
+        feeder=feederobj,
         state_filename=state_file,
         realtime_bar_target=realtime_bar_target
     )
