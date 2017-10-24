@@ -86,6 +86,9 @@ class TWSConnection(EClientSocket, EWrapper):
 
         log.info("Local-Broker Time Skew: {}".format(self.time_skew))
 
+    def _download_account_details(self):
+        pass
+
     @property
     def next_ticker_id(self):
         ticker_id = self._next_ticker_id
@@ -180,6 +183,39 @@ class TWSConnection(EClientSocket, EWrapper):
                 future_expiry, dividend_impact, dividends_to_expiry):
         log_message('tickEFP', vars())
 
+    def orderStatus(self, order_id, status, filled, remaining, avg_fill_price,
+                    perm_id, parent_id, last_fill_price, client_id, why_held):
+        log_message('orderStatus', vars())
+
+    def openOrder(self, order_id, contract, order, state):
+        log_message('openOrder', vars())
+
+    def openOrderEnd(self):
+        log_message('openOrderEnd', vars())
+
+    def updateAccountValue(self, key, value, currency, account_name):
+        pass
+
+    def updatePortfolio(self,
+                        contract,
+                        position,
+                        market_price,
+                        market_value,
+                        average_cost,
+                        unrealized_pnl,
+                        realized_pnl,
+                        account_name):
+        pass
+
+    def updateAccountTime(self, time_stamp):
+        pass
+
+    def accountDownloadEnd(self, account_name):
+        self.accounts_download_complete = True
+
+    def nextValidId(self, order_id):
+        self._next_order_id = order_id
+
     def contractDetails(self, req_id, contract_details):
         log_message('contractDetails', vars())
 
@@ -265,6 +301,12 @@ class TWSConnection(EClientSocket, EWrapper):
     def tickSnapshotEnd(self, req_id):
         log_message('tickSnapshotEnd', vars())
 
+    def position(self, account, contract, pos, avg_cost):
+        log_message('position', vars())
+
+    def positionEnd(self):
+        log_message('positionEnd', vars())
+
     def accountSummary(self, req_id, account, tag, value, currency):
         log_message('accountSummary', vars())
 
@@ -289,12 +331,14 @@ class IBFeeder(Feeder):
 
     def subscribe_to_market_data(self, asset):
         if asset not in self.subscribed_assets:
+            log.debug('subscribe_to_market_data: ' + str(asset.symbol))
             # remove str() cast to have a fun debugging journey
             self._tws.subscribe_to_market_data(str(asset.symbol))
             self._subscribed_assets.append(asset)
 
             while asset.symbol not in self._tws.bars:
-                sleep(0.1)
+                sleep(2)
+            log.debug('subscribe_to_market_data: DONE')
 
     @property
     def time_skew(self):
