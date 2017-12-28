@@ -16,7 +16,7 @@ from collections import namedtuple, defaultdict
 from time import sleep
 from math import fabs
 
-from six import itervalues
+from six import iteritems
 import pandas as pd
 import numpy as np
 
@@ -36,6 +36,17 @@ if sys.version_info > (3,):
     long = int
 
 log = Logger('IB Feeder')
+_connection_timeout = 15  # Seconds
+_poll_frequency = 1
+
+
+symbol_to_exchange = defaultdict(lambda: 'SMART')
+symbol_to_exchange['VIX'] = 'CBOE'
+symbol_to_exchange['GLD'] = 'ARCA'
+symbol_to_exchange['GDX'] = 'ARCA'
+
+symbol_to_sec_type = defaultdict(lambda: 'STK')
+symbol_to_sec_type['VIX'] = 'IND'
 
 
 def log_message(message, mapping):
@@ -50,6 +61,12 @@ def log_message(message, mapping):
         log.debug(('    %s:%s' % (k, v)))
 
 
+def _method_params_to_dict(args):
+    return {k: v
+            for k, v in iteritems(args)
+            if k != 'self'}
+
+
 class TWSConnection(EClientSocket, EWrapper):
     def __init__(self, tws_uri):
         EWrapper.__init__(self)
@@ -59,7 +76,7 @@ class TWSConnection(EClientSocket, EWrapper):
         host, port, client_id = self.tws_uri.split(':')
         self._host = host
         self._port = int(port)
-        self._client_id = int(client_id)
+        self.client_id = int(client_id)
 
         self._next_ticker_id = 0
         self.managed_accounts = None
@@ -68,21 +85,30 @@ class TWSConnection(EClientSocket, EWrapper):
         self.last_tick = defaultdict(dict)
         self.bars = {}
         self.time_skew = None
+        self.unrecoverable_error = False
 
         self.connect()
 
     def connect(self):
         log.info("Connecting: {}:{}:{}".format(self._host, self._port,
-                                               self._client_id))
-        self.eConnect(self._host, self._port, self._client_id)
-        while self.notConnected():
-            sleep(0.1)
+                                               self.client_id))
+        self.eConnect(self._host, self._port, self.client_id)
+        timeout = _connection_timeout
+        while timeout and not self.isConnected():
+            sleep(_poll_frequency)
+            timeout -= _poll_frequency
+        else:
+            if not self.isConnected():
+                raise SystemError("Connection timeout during TWS connection!")
+
+        # self._download_account_details()
+        # log.info("Managed accounts: {}".format(self.managed_accounts))
 
         self.reqCurrentTime()
         self.reqIds(1)
 
-        while self.time_skew is None:
-            sleep(0.1)
+        while self.time_skew is None or self._next_order_id is None:
+            sleep(_poll_frequency)
 
         log.info("Local-Broker Time Skew: {}".format(self.time_skew))
 
@@ -106,10 +132,9 @@ class TWSConnection(EClientSocket, EWrapper):
 
         contract = Contract()
         contract.m_symbol = symbol
-        contract.m_secType = sec_type
-        contract.m_exchange = exchange
+        contract.m_secType = symbol_to_sec_type[symbol]
+        contract.m_exchange = symbol_to_exchange[symbol]
         contract.m_currency = currency
-
         ticker_id = self.next_ticker_id
 
         self.symbol_to_ticker_id[symbol] = ticker_id
@@ -183,16 +208,6 @@ class TWSConnection(EClientSocket, EWrapper):
                 future_expiry, dividend_impact, dividends_to_expiry):
         log_message('tickEFP', vars())
 
-    def orderStatus(self, order_id, status, filled, remaining, avg_fill_price,
-                    perm_id, parent_id, last_fill_price, client_id, why_held):
-        log_message('orderStatus', vars())
-
-    def openOrder(self, order_id, contract, order, state):
-        log_message('openOrder', vars())
-
-    def openOrderEnd(self):
-        log_message('openOrderEnd', vars())
-
     def updateAccountValue(self, key, value, currency, account_name):
         pass
 
@@ -232,18 +247,33 @@ class TWSConnection(EClientSocket, EWrapper):
         log_message('execDetailsEnd', vars())
 
     def connectionClosed(self):
-        log_message('connectionClosed', {})
+        self.unrecoverable_error = True
+        log.error("IB Connection closed")
 
     def error(self, id_=None, error_code=None, error_msg=None):
+        if isinstance(id_, Exception):
+            # XXX: for an unknown reason 'log' is None in this branch,
+            # therefore it needs to be instantiated before use
+            global log
+            if not log:
+                log = Logger('IB Broker')
+            log.exception(id_)
+
+        if isinstance(error_code, EClientErrors.CodeMsgPair):
+            error_msg = error_code.msg()
+            error_code = error_code.code()
+
         if isinstance(error_code, int):
+            if error_code in (502, 503, 326):
+                # 502: Couldn't connect to TWS.
+                # 503: The TWS is out of date and must be upgraded.
+                # 326: Unable connect as the client id is already in use.
+                self.unrecoverable_error = True
+
             if error_code < 1000:
                 log.error("[{}] {} ({})".format(error_code, error_msg, id_))
             else:
-                log.info("[{}] {}".format(error_code, error_msg, id_))
-        elif isinstance(error_code, EClientErrors.CodeMsgPair):
-            log.error("[{}] {}".format(error_code.code(),
-                                       error_code.msg(),
-                                       id_))
+                log.info("[{}] {} ({})".format(error_code, error_msg, id_))
         else:
             log.error("[{}] {} ({})".format(error_code, error_msg, id_))
 
@@ -329,20 +359,51 @@ class IBFeeder(Feeder):
     def subscribed_assets(self):
         return self._subscribed_assets
 
-    def subscribe_to_market_data(self, asset):
-        if asset not in self.subscribed_assets:
-            log.debug('subscribe_to_market_data: ' + str(asset.symbol))
-            # remove str() cast to have a fun debugging journey
-            self._tws.subscribe_to_market_data(str(asset.symbol))
-            self._subscribed_assets.append(asset)
+    def subscribe_to_market_data(self, assets):
+        if type(assets) is list:
+            wait_assets = []
+            for asset in assets:
+                if asset not in self.subscribed_assets:
+                    wait_assets.append(asset)
+                    log.debug('subscribe_to_market_data: ' + str(asset.symbol))
+                    # remove str() cast to have a fun debugging journey
+                    self._tws.subscribe_to_market_data(str(asset.symbol))
+                    self._subscribed_assets.append(asset)
+            if wait_assets:
+                while wait_assets:
+                    wait_assets = [
+                        asset for asset in wait_assets if asset.symbol not in self._tws.bars]
+                    if wait_assets:
+                        sleep(2)
+                log.debug('subscribe_to_market_data: DONE')
 
-            while asset.symbol not in self._tws.bars:
-                sleep(2)
-            log.debug('subscribe_to_market_data: DONE')
+        else:
+            asset = assets
+            if asset not in self.subscribed_assets:
+                log.debug('subscribe_to_market_data: ' + str(asset.symbol))
+                # remove str() cast to have a fun debugging journey
+                self._tws.subscribe_to_market_data(str(asset.symbol))
+                self._subscribed_assets.append(asset)
+
+                while asset.symbol not in self._tws.bars:
+                    sleep(2)
+                log.debug('subscribe_to_market_data: DONE')
 
     @property
     def time_skew(self):
         return self._tws.time_skew
+
+    def is_alive(self):
+        return not self._tws.unrecoverable_error
+
+    @staticmethod
+    def _safe_symbol_lookup(symbol):
+        try:
+            return symbol_lookup(symbol)
+        except SymbolNotFound:
+            return None
+
+    _zl_order_ref_magic = '!ZL'
 
     def get_spot_value(self, assets, field, dt, data_frequency):
         symbol = str(assets.symbol)
@@ -395,9 +456,9 @@ class IBFeeder(Feeder):
             raise ValueError("Invalid frequency specified: %s" % frequency)
 
         df = pd.DataFrame()
+        self.subscribe_to_market_data(assets)
         for asset in assets:
             symbol = str(asset.symbol)
-            self.subscribe_to_market_data(asset)
 
             trade_prices = self._tws.bars[symbol]['last_trade_price']
             trade_sizes = self._tws.bars[symbol]['last_trade_size']

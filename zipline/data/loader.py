@@ -227,6 +227,13 @@ def ensure_benchmark_data(symbol, first_date, last_date, now, trading_day,
     except (OSError, IOError, HTTPError):
         logger.exception('failed to cache the new benchmark returns')
         raise
+    except:
+        logger.exception(
+            'failed to cache the new benchmark returns, use local cache instead')
+        data = _load_cached_data(filename, first_date, last_date, now, 'benchmark',
+                                 environ, False)
+        return data
+
     if not has_data_for_dates(data, first_date, last_date):
         logger.warn("Still don't have expected data after redownload!")
     return data
@@ -284,7 +291,7 @@ def ensure_treasury_data(symbol, first_date, last_date, now, environ=None):
 
 
 def _load_cached_data(filename, first_date, last_date, now, resource_name,
-                      environ=None):
+                      environ=None, verify_date=True):
     if resource_name == 'benchmark':
         from_csv = pd.Series.from_csv
     else:
@@ -298,7 +305,7 @@ def _load_cached_data(filename, first_date, last_date, now, resource_name,
     if os.path.exists(path):
         try:
             data = from_csv(path).tz_localize('UTC')
-            if has_data_for_dates(data, first_date, last_date):
+            if not verify_date or has_data_for_dates(data, first_date, last_date):
                 return data
 
             # Don't re-download if we've successfully downloaded and written a
