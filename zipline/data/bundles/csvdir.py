@@ -62,6 +62,8 @@ def RetryingDataReader(*args, **kwargs):
     return DataReader(*args, **kwargs)
 
 def download_splits_and_dividends(symbols, metadata, session):
+    return None, None
+    
     adjustments = []
     for sid, symbol in enumerate(symbols):
         try:
