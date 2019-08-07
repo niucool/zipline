@@ -9,6 +9,7 @@ from numpy import empty
 from pandas import DataFrame, read_csv, Index, Timedelta, NaT, concat
 
 import requests
+import yfinance
 from pandas_datareader.data import DataReader
 from pandas_datareader._utils import RemoteDataError
 
@@ -62,44 +63,44 @@ def RetryingDataReader(*args, **kwargs):
     return DataReader(*args, **kwargs)
 
 def download_splits_and_dividends(symbols, metadata, session):
-    return None, None
+    # return None, None
     
     adjustments = []
     for sid, symbol in enumerate(symbols):
         try:
-            logger.debug("Downloading splits/dividends for %s" % symbol)
-            df = RetryingDataReader(symbol,
-                                    'yahoo-actions',
-                                    metadata.ix[sid].start_date,
-                                    metadata.ix[sid].end_date,
-                                    session=session).sort_index()
+            logger.debug("Downloading splits for %s" % symbol)
+            ticker = yfinance.Ticker(symbol)
+            df = ticker.splits.to_frame(name='ratio')
         except RemoteDataError:
             logger.warning("No data returned from Yahoo for %s" % symbol)
-            df = DataFrame(columns=['value', 'action'])
+            df = DataFrame(columns=['ratio'])
 
         df['sid'] = sid
         adjustments.append(df)
 
-    adj_df = concat(adjustments)
-    adj_df.index.name = 'date'
-    adj_df.reset_index(inplace=True)
+    splits_df = concat(adjustments)
+    splits_df.index.name = 'effective_date'
+    splits_df.reset_index(inplace=True)
 
-    splits_df = adj_df[adj_df['action'] == 'SPLIT']
-    splits_df = splits_df.rename(
-        columns={'value': 'ratio', 'date': 'effective_date'},
-    )
-    splits_df.drop('action', axis=1, inplace=True)
-    splits_df.reset_index(inplace=True, drop=True)
+    adjustments = []
+    for sid, symbol in enumerate(symbols):
+        try:
+            logger.debug("Downloading dividends for %s" % symbol)
+            ticker = yfinance.Ticker(symbol)
+            df = ticker.dividends.to_frame(name='amount')
+        except RemoteDataError:
+            logger.warning("No data returned from Yahoo for %s" % symbol)
+            df = DataFrame(columns=['amount'])
 
-    dividends_df = adj_df[adj_df['action'] == 'DIVIDEND']
-    dividends_df = dividends_df.rename(
-        columns={'value': 'amount', 'date': 'ex_date'},
-    )
-    dividends_df.drop('action', axis=1, inplace=True)
+        df['sid'] = sid
+        adjustments.append(df)
+    
     # we do not have this data in the yahoo dataset
+    dividends_df = concat(adjustments)
     dividends_df['record_date'] = NaT
     dividends_df['declared_date'] = NaT
     dividends_df['pay_date'] = NaT
+    dividends_df.index.name = 'ex_date'
     dividends_df.reset_index(inplace=True, drop=True)
 
     return splits_df, dividends_df
