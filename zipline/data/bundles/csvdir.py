@@ -62,46 +62,55 @@ def csvdir_equities(tframes=['daily'], start=None, end=None):
 def RetryingDataReader(*args, **kwargs):
     return DataReader(*args, **kwargs)
 
-def download_splits_and_dividends(symbols, metadata, session):
+def download_splits_and_dividends(symbols, metadata):
     # return None, None
     
+    print(metadata)
     adjustments = []
+    splits_df = None
     for sid, symbol in enumerate(symbols):
         try:
-            logger.debug("Downloading splits for %s" % symbol)
+            print("Downloading splits for %s" % symbol)
             ticker = yfinance.Ticker(symbol)
             df = ticker.splits.to_frame(name='ratio')
-        except RemoteDataError:
-            logger.warning("No data returned from Yahoo for %s" % symbol)
+            df = df[(df.index >= metadata.ix[sid].start_date) & (df.index <= metadata.ix[sid].end_date)]
+        except:
+            print("No data returned from Yahoo for %s" % symbol)
             df = DataFrame(columns=['ratio'])
 
-        df['sid'] = sid
-        adjustments.append(df)
+        if not df.empty:
+            df['sid'] = sid
+            adjustments.append(df)
 
-    splits_df = concat(adjustments)
-    splits_df.index.name = 'effective_date'
-    splits_df.reset_index(inplace=True)
+    if adjustments:
+        splits_df = concat(adjustments)
+        splits_df.index.name = 'effective_date'
+        splits_df.reset_index(inplace=True)
 
     adjustments = []
+    dividends_df = None
     for sid, symbol in enumerate(symbols):
         try:
-            logger.debug("Downloading dividends for %s" % symbol)
+            print("Downloading dividends for %s" % symbol)
             ticker = yfinance.Ticker(symbol)
             df = ticker.dividends.to_frame(name='amount')
-        except RemoteDataError:
-            logger.warning("No data returned from Yahoo for %s" % symbol)
+            df = df[(df.index >= metadata.ix[sid].start_date) & (df.index <= metadata.ix[sid].end_date)]
+        except:
+            print("No data returned from Yahoo for %s" % symbol)
             df = DataFrame(columns=['amount'])
 
-        df['sid'] = sid
-        adjustments.append(df)
+        if not df.empty:
+            df['sid'] = sid
+            adjustments.append(df)
     
     # we do not have this data in the yahoo dataset
-    dividends_df = concat(adjustments)
-    dividends_df['record_date'] = NaT
-    dividends_df['declared_date'] = NaT
-    dividends_df['pay_date'] = NaT
-    dividends_df.index.name = 'ex_date'
-    dividends_df.reset_index(inplace=True, drop=True)
+    if adjustments:
+        dividends_df = concat(adjustments)
+        dividends_df['record_date'] = NaT
+        dividends_df['declared_date'] = NaT
+        dividends_df['pay_date'] = NaT
+        dividends_df.index.name = 'ex_date'
+        dividends_df.reset_index(inplace=True)
 
     return splits_df, dividends_df
 
@@ -180,11 +189,9 @@ class CSVDIRBundle:
         # code from: https://gist.github.com/tibkiss/d917ff389d479f32fff303f53893c3c5
         # adjustment_writer.write(splits=self.splits, dividends=self.dividends)
 
-        with requests.Session() as session:
-            splits, dividends = download_splits_and_dividends(
-                self.symbols,
-                self.metadata,
-                session)
+        splits, dividends = download_splits_and_dividends(
+            self.symbols,
+            self.metadata)
 
         adjustment_writer.write(splits=splits, dividends=dividends)
 
