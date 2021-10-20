@@ -15,12 +15,14 @@
 from datetime import timedelta, time
 from itertools import chain
 
-from nose_parameterized import parameterized
+from parameterized import parameterized
 import numpy as np
 from numpy import nan
 from numpy.testing import assert_almost_equal
 import pandas as pd
 from toolz import concat
+from trading_calendars import get_calendar
+from trading_calendars.utils.pandas_utils import days_at_time
 
 from zipline._protocol import handle_non_market_minutes
 
@@ -40,8 +42,6 @@ from zipline.testing.fixtures import (
     WithDataPortal,
     ZiplineTestCase,
 )
-from zipline.utils.calendars import get_calendar
-from zipline.utils.calendars.trading_calendar import days_at_time
 
 OHLC = ["open", "high", "low", "close"]
 OHLCP = OHLC + ["price"]
@@ -768,7 +768,7 @@ class TestMinuteBarDataFuturesCalendar(WithCreateBarData,
                     'notice_date': pd.Timestamp('2016-01-22', tz='UTC'),
                     'expiration_date': pd.Timestamp('2016-02-22', tz='UTC'),
                     'auto_close_date': pd.Timestamp('2016-01-20', tz='UTC'),
-                    'exchange': 'CME',
+                    'exchange': 'CMES',
                 },
             },
             orient='index',
@@ -777,7 +777,7 @@ class TestMinuteBarDataFuturesCalendar(WithCreateBarData,
     @classmethod
     def init_class_fixtures(cls):
         super(TestMinuteBarDataFuturesCalendar, cls).init_class_fixtures()
-        cls.trading_calendar = get_calendar('CME')
+        cls.trading_calendar = get_calendar('CMES')
 
     def test_can_trade_multiple_exchange_closed(self):
         nyse_asset = self.asset_finder.retrieve_asset(1)
@@ -819,7 +819,7 @@ class TestMinuteBarDataFuturesCalendar(WithCreateBarData,
         ]
 
         for info in minutes_to_check:
-            # use the CME calendar, which covers 24 hours
+            # use the CMES calendar, which covers 24 hours
             bar_data = self.create_bardata(
                 simulation_dt_func=lambda: info[0],
             )
@@ -831,22 +831,22 @@ class TestMinuteBarDataFuturesCalendar(WithCreateBarData,
 
     def test_can_trade_delisted(self):
         """
-        Test that can_trade returns False for an asset on or after its auto
-        close date.
+        Test that can_trade returns False for an asset after its auto close
+        date.
         """
         auto_closing_asset = self.asset_finder.retrieve_asset(7)
 
         # Our asset's auto close date is 2016-01-20, which means that as of the
-        # market open for the 2016-01-20 session, `can_trade` should return
+        # market open for the 2016-01-21 session, `can_trade` should return
         # False.
         minutes_to_check = [
-            (pd.Timestamp('2016-01-19 00:00:00', tz='UTC'), True),
-            (pd.Timestamp('2016-01-19 23:00:00', tz='UTC'), True),
-            (pd.Timestamp('2016-01-19 23:01:00', tz='UTC'), False),
-            (pd.Timestamp('2016-01-19 23:59:00', tz='UTC'), False),
-            (pd.Timestamp('2016-01-20 00:00:00', tz='UTC'), False),
-            (pd.Timestamp('2016-01-20 00:01:00', tz='UTC'), False),
+            (pd.Timestamp('2016-01-20 00:00:00', tz='UTC'), True),
+            (pd.Timestamp('2016-01-20 23:00:00', tz='UTC'), True),
+            (pd.Timestamp('2016-01-20 23:01:00', tz='UTC'), False),
+            (pd.Timestamp('2016-01-20 23:59:00', tz='UTC'), False),
             (pd.Timestamp('2016-01-21 00:00:00', tz='UTC'), False),
+            (pd.Timestamp('2016-01-21 00:01:00', tz='UTC'), False),
+            (pd.Timestamp('2016-01-22 00:00:00', tz='UTC'), False),
         ]
 
         for info in minutes_to_check:
@@ -865,7 +865,7 @@ class TestDailyBarData(WithCreateBarData,
     )
     CREATE_BARDATA_DATA_FREQUENCY = 'daily'
 
-    sids = ASSET_FINDER_EQUITY_SIDS = set(range(1, 9))
+    ASSET_FINDER_EQUITY_SIDS = set(range(1, 9))
 
     SPLIT_ASSET_SID = 3
     ILLIQUID_SPLIT_ASSET_SID = 4
@@ -950,11 +950,16 @@ class TestDailyBarData(WithCreateBarData,
 
     @classmethod
     def make_adjustment_writer_equity_daily_bar_reader(cls):
-        return MockDailyBarReader()
+        return MockDailyBarReader(
+            dates=cls.trading_calendar.sessions_in_range(
+                cls.START_DATE,
+                cls.END_DATE,
+            ),
+        )
 
     @classmethod
-    def make_equity_daily_bar_data(cls):
-        for sid in cls.sids:
+    def make_equity_daily_bar_data(cls, country_code, sids):
+        for sid in sids:
             asset = cls.asset_finder.retrieve_asset(sid)
             yield sid, create_daily_df_for_asset(
                 cls.trading_calendar,

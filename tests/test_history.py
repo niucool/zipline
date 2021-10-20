@@ -12,34 +12,28 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+from collections import OrderedDict
 from textwrap import dedent
 
-from nose_parameterized import parameterized
+from parameterized import parameterized
 import numpy as np
 from numpy import nan
 import pandas as pd
 from six import iteritems
 
-from zipline import TradingAlgorithm
 from zipline._protocol import handle_non_market_minutes, BarData
 from zipline.assets import Asset, Equity
 from zipline.errors import (
     HistoryInInitialize,
     HistoryWindowStartsBeforeData,
 )
-from zipline.finance.trading import SimulationParameters
 from zipline.finance.asset_restrictions import NoRestrictions
 from zipline.testing import (
     create_minute_df_for_asset,
     str_to_seconds,
     MockDailyBarReader,
 )
-from zipline.testing.fixtures import (
-    WithCreateBarData,
-    WithDataPortal,
-    ZiplineTestCase,
-    alias,
-)
+import zipline.testing.fixtures as zf
 
 
 OHLC = ['open', 'high', 'low', 'close']
@@ -47,7 +41,7 @@ OHLCP = OHLC + ['price']
 ALL_FIELDS = OHLCP + ['volume']
 
 
-class WithHistory(WithCreateBarData, WithDataPortal):
+class WithHistory(zf.WithCreateBarData, zf.WithDataPortal):
     TRADING_START_DT = TRADING_ENV_MIN_DATE = START_DATE = pd.Timestamp(
         '2014-01-03',
         tz='UTC',
@@ -240,7 +234,12 @@ class WithHistory(WithCreateBarData, WithDataPortal):
 
     @classmethod
     def make_adjustment_writer_equity_daily_bar_reader(cls):
-        return MockDailyBarReader()
+        return MockDailyBarReader(
+            dates=cls.trading_calendar.sessions_in_range(
+                cls.TRADING_START_DT,
+                cls.TRADING_END_DT,
+            ),
+        )
 
     def verify_regular_dt(self, idx, dt, mode, fields=None, assets=None):
         if mode == 'daily':
@@ -530,10 +529,12 @@ MINUTE_FIELD_INFO = {
 }
 
 
-class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
+class MinuteEquityHistoryTestCase(WithHistory,
+                                  zf.WithMakeAlgo,
+                                  zf.ZiplineTestCase):
 
     EQUITY_DAILY_BAR_SOURCE_FROM_MINUTE = True
-    DATA_PORTAL_FIRST_TRADING_DAY = alias('TRADING_START_DT')
+    DATA_PORTAL_FIRST_TRADING_DAY = zf.alias('TRADING_START_DT')
 
     @classmethod
     def make_equity_minute_bar_data(cls):
@@ -618,28 +619,26 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
                 pass
             """
         )
-
-        start = pd.Timestamp('2014-04-05', tz='UTC')
-        end = pd.Timestamp('2014-04-10', tz='UTC')
-
-        sim_params = SimulationParameters(
-            start_session=start,
-            end_session=end,
-            capital_base=float('1.0e5'),
-            data_frequency='minute',
-            emission_rate='daily',
-            trading_calendar=self.trading_calendar,
-        )
-
-        test_algo = TradingAlgorithm(
-            script=algo_text,
-            data_frequency='minute',
-            sim_params=sim_params,
-            env=self.env,
-        )
-
+        algo = self.make_algo(script=algo_text)
         with self.assertRaises(HistoryInInitialize):
-            test_algo.initialize()
+            algo.run()
+
+    def test_negative_bar_count(self):
+        """
+        Negative bar counts leak future information.
+        """
+        with self.assertRaisesRegex(
+                ValueError,
+                "bar_count must be >= 1, but got -1"
+        ):
+            self.data_portal.get_history_window(
+                [self.ASSET1],
+                pd.Timestamp('2015-01-07 14:35', tz='UTC'),
+                -1,
+                '1d',
+                'close',
+                'minute',
+            )
 
     def test_daily_splits_and_mergers(self):
         # self.SPLIT_ASSET and self.MERGER_ASSET had splits/mergers
@@ -716,7 +715,7 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         # before any of the dividends
         window1 = self.data_portal.get_history_window(
             [asset],
-            self.trading_calendar.open_and_close_for_session(jan5)[1],
+            self.trading_calendar.session_close(jan5),
             2,
             '1d',
             'close',
@@ -820,12 +819,11 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         ('low_sid_3', 'low', 3),
         ('close_sid_3', 'close', 3),
         ('volume_sid_3', 'volume', 3),
-
     ])
     def test_minute_regular(self, name, field, sid):
         # asset2 and asset3 both started on 1/5/2015, but asset3 trades every
         # 10 minutes
-        asset = self.env.asset_finder.retrieve_asset(sid)
+        asset = self.asset_finder.retrieve_asset(sid)
 
         # Check the first hour of equities trading.
         minutes = self.trading_calendars[Equity].minutes_for_session(
@@ -1390,14 +1388,14 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
             'window, start the backtest on or after 2014-01-06.'
         )
         for field in OHLCP:
-            with self.assertRaisesRegexp(
+            with self.assertRaisesRegex(
                     HistoryWindowStartsBeforeData, exp_msg):
                 self.data_portal.get_history_window(
                     [self.ASSET1],
                     first_day_minutes[5],
                     15,
                     '1m',
-                    'price',
+                    field,
                     'minute',
                 )[self.ASSET1]
 
@@ -1592,17 +1590,93 @@ class MinuteEquityHistoryTestCase(WithHistory, ZiplineTestCase):
                                            err_msg='field={0} minute={1}'.
                                            format(field, minute))
 
+    @parameterized.expand([(("bar_count%s" % x), x) for x in [1, 2, 3]])
+    def test_daily_history_minute_gaps_price_ffill(self, test_name, bar_count):
+        # Make sure we use the previous day's value when there's been no volume
+        # yet today.
+
+        # January 5 2015 is the first day, and there is volume only every
+        # 10 minutes.
+
+        # January 6 has the same volume pattern and is used here to ensure we
+        # ffill correctly from the previous day when there is no volume yet
+        # today.
+
+        # January 12 is a Monday, ensuring we ffill correctly when the previous
+        # day is not a trading day.
+        for day_idx, day in enumerate([pd.Timestamp('2015-01-05', tz='UTC'),
+                                       pd.Timestamp('2015-01-06', tz='UTC'),
+                                       pd.Timestamp('2015-01-12', tz='UTC')]):
+
+            session_minutes = self.trading_calendar.minutes_for_session(day)
+
+            equity_cal = self.trading_calendars[Equity]
+            equity_minutes = equity_cal.minutes_for_session(day)
+
+            if day_idx == 0:
+                # dedupe when session_minutes are same as equity_minutes
+                minutes_to_test = OrderedDict([
+                    (session_minutes[0], np.nan),  # No volume yet on first day
+                    (equity_minutes[0], np.nan),   # No volume yet on first day
+                    (equity_minutes[1], np.nan),   # ...
+                    (equity_minutes[8], np.nan),   # Minute before > 0 volume
+                    (equity_minutes[9], 11.0),     # We have a price!
+                    (equity_minutes[10], 11.0),    # ffill
+                    (equity_minutes[-2], 381.0),   # ...
+                    (equity_minutes[-1], 391.0),   # Last minute of exchange
+                    (session_minutes[-1], 391.0),  # Last minute of day
+                ])
+            elif day_idx == 1:
+                minutes_to_test = OrderedDict([
+                    (session_minutes[0], 391.0),   # ffill from yesterday
+                    (equity_minutes[0], 391.0),    # ...
+                    (equity_minutes[8], 391.0),    # ...
+                    (equity_minutes[9], 401.0),    # New price today
+                    (equity_minutes[-1], 781.0),   # Last minute of exchange
+                    (session_minutes[-1], 781.0),  # Last minute of day
+                ])
+            else:
+                minutes_to_test = OrderedDict([
+                    (session_minutes[0], 1951.0),  # ffill from previous week
+                    (equity_minutes[0], 1951.0),   # ...
+                    (equity_minutes[8], 1951.0),   # ...
+                    (equity_minutes[9], 1961.0),   # New price today
+                ])
+
+            for minute, expected in minutes_to_test.items():
+
+                window = self.data_portal.get_history_window(
+                    [self.ASSET3],
+                    minute,
+                    bar_count,
+                    '1d',
+                    'price',
+                    'minute',
+                )[self.ASSET3]
+
+                self.assertEqual(
+                    len(window),
+                    bar_count,
+                    "Unexpected window length at {}. Expected {}, but was {}."
+                    .format(minute, bar_count, len(window))
+                )
+                np.testing.assert_allclose(
+                    window[-1],
+                    expected,
+                    err_msg="at minute {}".format(minute),
+                )
+
 
 class NoPrefetchMinuteEquityHistoryTestCase(MinuteEquityHistoryTestCase):
     DATA_PORTAL_MINUTE_HISTORY_PREFETCH = 0
     DATA_PORTAL_DAILY_HISTORY_PREFETCH = 0
 
 
-class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
+class DailyEquityHistoryTestCase(WithHistory, zf.ZiplineTestCase):
     CREATE_BARDATA_DATA_FREQUENCY = 'daily'
 
     @classmethod
-    def make_equity_daily_bar_data(cls):
+    def make_equity_daily_bar_data(cls, country_code, sids):
         yield 1, cls.create_df_for_asset(
             cls.START_DATE,
             pd.Timestamp('2016-01-30', tz='UTC')
@@ -1698,7 +1772,7 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         # 10 days
 
         # get the first 30 days of 2015
-        jan5 = pd.Timestamp('2015-01-05')
+        jan5 = pd.Timestamp('2015-01-05', tz='utc')
 
         # Regardless of the calendar used for this test, equities will
         # only have data on NYSE sessions.
@@ -1956,7 +2030,7 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
             'window, start the backtest on or after 2014-01-09.'
         )
 
-        with self.assertRaisesRegexp(HistoryWindowStartsBeforeData, exp_msg):
+        with self.assertRaisesRegex(HistoryWindowStartsBeforeData, exp_msg):
             self.data_portal.get_history_window(
                 [self.ASSET1],
                 second_day,
@@ -1966,7 +2040,7 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
                 'daily',
             )[self.ASSET1]
 
-        with self.assertRaisesRegexp(HistoryWindowStartsBeforeData, exp_msg):
+        with self.assertRaisesRegex(HistoryWindowStartsBeforeData, exp_msg):
             self.data_portal.get_history_window(
                 [self.ASSET1],
                 second_day,
@@ -1980,7 +2054,7 @@ class DailyEquityHistoryTestCase(WithHistory, ZiplineTestCase):
         first_minute = \
             self.trading_calendar.schedule.market_open[self.TRADING_START_DT]
 
-        with self.assertRaisesRegexp(HistoryWindowStartsBeforeData, exp_msg):
+        with self.assertRaisesRegex(HistoryWindowStartsBeforeData, exp_msg):
             self.data_portal.get_history_window(
                 [self.ASSET2],
                 first_minute,

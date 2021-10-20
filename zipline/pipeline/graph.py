@@ -1,10 +1,9 @@
 """
 Dependency-Graph representation of Pipeline API terms.
 """
-from networkx import (
-    DiGraph,
-    topological_sort,
-)
+import uuid
+
+import networkx as nx
 from six import iteritems, itervalues
 from zipline.utils.memoize import lazyval
 from zipline.pipeline.visualize import display_graph
@@ -14,6 +13,14 @@ from .term import LoadableTerm
 
 class CyclicDependency(Exception):
     pass
+
+
+# This sentinel value is uniquely-generated at import time so that we can
+# guarantee that it never conflicts with a user-provided column name.
+#
+# (Yes, technically, a user can import this file and pass this as the name of a
+# column. If you do that you deserve whatever bizarre failure you cause.)
+SCREEN_NAME = 'screen_' + uuid.uuid4().hex
 
 
 class TermGraph(object):
@@ -38,13 +45,16 @@ class TermGraph(object):
     -------
     ordered()
         Return a topologically-sorted iterator over the terms in self.
+    execution_order(workspace, refcounts)
+        Return a topologically-sorted iterator over the terms in self, skipping
+        entries in ``workspace`` and entries with refcounts of zero.
 
     See Also
     --------
     ExecutionPlan
     """
     def __init__(self, terms):
-        self.graph = DiGraph()
+        self.graph = nx.DiGraph()
 
         self._frozen = False
         parents = set()
@@ -57,6 +67,9 @@ class TermGraph(object):
 
         # Mark that no more terms should be added to the graph.
         self._frozen = True
+
+    def __contains__(self, term):
+        return term in self.graph
 
     def _add_to_graph(self, term, parents):
         """
@@ -93,25 +106,44 @@ class TermGraph(object):
         """
         return self._outputs
 
-    def execution_order(self, refcounts):
+    @property
+    def screen_name(self):
+        """Name of the specially-designated ``screen`` term for the pipeline.
         """
-        Return a topologically-sorted iterator over the terms in ``self`` which
+        return SCREEN_NAME
+
+    def execution_order(self, workspace, refcounts):
+        """
+        Return a topologically-sorted list of the terms in ``self`` which
         need to be computed.
+
+        Filters out any terms that are already present in ``workspace``, as
+        well as any terms with refcounts of 0.
+
+        Parameters
+        ----------
+        workspace : dict[Term, np.ndarray]
+            Initial state of workspace for a pipeline execution. May contain
+            pre-computed values provided by ``populate_initial_workspace``.
+        refcounts : dict[Term, int]
+            Reference counts for terms to be computed. Terms with reference
+            counts of 0 do not need to be computed.
         """
-        return iter(topological_sort(
+        return list(nx.topological_sort(
             self.graph.subgraph(
-                {term for term, refcount in refcounts.items() if refcount > 0},
+                {
+                    term for term, refcount in refcounts.items()
+                    if refcount > 0 and term not in workspace
+                },
             ),
         ))
 
     def ordered(self):
-        return iter(topological_sort(self.graph))
+        return iter(nx.topological_sort(self.graph))
 
     @lazyval
     def loadable_terms(self):
-        return tuple(
-            term for term in self.graph if isinstance(term, LoadableTerm)
-        )
+        return {term for term in self.graph if isinstance(term, LoadableTerm)}
 
     @lazyval
     def jpeg(self):
@@ -146,11 +178,11 @@ class TermGraph(object):
             refcounts[t] += 1
 
         for t in initial_terms:
-            self._decref_depencies_recursive(t, refcounts, set())
+            self._decref_dependencies_recursive(t, refcounts, set())
 
         return refcounts
 
-    def _decref_depencies_recursive(self, term, refcounts, garbage):
+    def _decref_dependencies_recursive(self, term, refcounts, garbage):
         """
         Decrement terms recursively.
 
@@ -167,7 +199,7 @@ class TermGraph(object):
             # workspace to conserve memory.
             if refcounts[parent] == 0:
                 garbage.add(parent)
-                self._decref_depencies_recursive(parent, refcounts, garbage)
+                self._decref_dependencies_recursive(parent, refcounts, garbage)
 
     def decref_dependencies(self, term, refcounts):
         """
@@ -195,6 +227,9 @@ class TermGraph(object):
                 garbage.add(parent)
         return garbage
 
+    def __len__(self):
+        return len(self.graph)
+
 
 class ExecutionPlan(TermGraph):
     """
@@ -209,11 +244,10 @@ class ExecutionPlan(TermGraph):
 
     Parameters
     ----------
+    domain : zipline.pipeline.domain.Domain
+        The domain of execution for which we need to build a plan.
     terms : dict
         A dict mapping names to final output terms.
-    all_dates : pd.DatetimeIndex
-        An index of all known trading days for which ``terms`` will be
-        computed.
     start_date : pd.Timestamp
         The first date for which output is requested for ``terms``.
     end_date : pd.Timestamp
@@ -221,31 +255,49 @@ class ExecutionPlan(TermGraph):
 
     Attributes
     ----------
+    domain
+    extra_rows
     outputs
     offset
-    extra_rows
-
-    Methods
-    -------
-    ordered()
-        Return a topologically-sorted iterator over the terms in self.
     """
     def __init__(self,
+                 domain,
                  terms,
-                 all_dates,
                  start_date,
                  end_date,
                  min_extra_rows=0):
         super(ExecutionPlan, self).__init__(terms)
 
+        # Specialize all the LoadableTerms in the graph to our domain, so that
+        # when the engine requests an execution order, we emit the specialized
+        # versions of loadable terms.
+        #
+        # NOTE: We're explicitly avoiding using self.loadable_terms here.
+        #
+        # At this point the graph still contains un-specialized loadable terms,
+        # and this is where we're actually going through and specializing all
+        # of them. We don't want use self.loadable_terms because it's a
+        # lazyval, and we don't want its result to be cached until after we've
+        # specialized.
+        specializations = {
+            t: t.specialize(domain)
+            for t in self.graph if isinstance(t, LoadableTerm)
+        }
+        self.graph = nx.relabel_nodes(self.graph, specializations)
+
+        self.domain = domain
+
+        sessions = domain.all_sessions()
         for term in terms.values():
             self.set_extra_rows(
                 term,
-                all_dates,
+                sessions,
                 start_date,
                 end_date,
                 min_extra_rows=min_extra_rows,
             )
+
+        self._assert_all_loadable_terms_specialized_to(domain)
 
     def set_extra_rows(self,
                        term,
@@ -253,9 +305,9 @@ class ExecutionPlan(TermGraph):
                        start_date,
                        end_date,
                        min_extra_rows):
-        """
-        Compute ``extra_rows`` for transitive dependencies of ``root_terms``
-        """
+        # Specialize any loadable terms before adding extra rows.
+        term = maybe_specialize(term, self.domain)
+
         # A term can require that additional extra rows beyond the minimum be
         # computed.  This is most often used with downsampled terms, which need
         # to ensure that the first date is a computation date.
@@ -344,19 +396,26 @@ class ExecutionPlan(TermGraph):
 
         See Also
         --------
-        zipline.pipeline.graph.TermGraph.offset
-        zipline.pipeline.engine.SimplePipelineEngine._inputs_for_term
-        zipline.pipeline.engine.SimplePipelineEngine._mask_and_dates_for_term
+        :meth:`zipline.pipeline.graph.ExecutionPlan.offset`
+        :meth:`zipline.pipeline.engine.ExecutionPlan.mask_and_dates_for_term`
+        :meth:`zipline.pipeline.engine.SimplePipelineEngine._inputs_for_term`
         """
         extra = self.extra_rows
-        return {
-            # Another way of thinking about this is:
-            # How much bigger is the array for ``dep`` compared to ``term``?
-            # How much of that difference did I ask for.
-            (term, dep): (extra[dep] - extra[term]) - requested_extra_rows
-            for term in self.graph
-            for dep, requested_extra_rows in term.dependencies.items()
-        }
+
+        out = {}
+        for term in self.graph:
+            for dep, requested_extra_rows in term.dependencies.items():
+                specialized_dep = maybe_specialize(dep, self.domain)
+
+                # How much bigger is the result for dep compared to term?
+                size_difference = extra[specialized_dep] - extra[term]
+
+                # Subtract the portion of that difference that was required by
+                # term's lookback window.
+                offset = size_difference - requested_extra_rows
+                out[term, specialized_dep] = offset
+
+        return out
 
     @lazyval
     def extra_rows(self):
@@ -370,8 +429,8 @@ class ExecutionPlan(TermGraph):
         which describes how many additional rows of `term`'s inputs we need to
         load, and which is determined entirely by `Term` itself.
 
-        Example
-        -------
+        Examples
+        --------
         Our graph contains the following terms:
 
             A = SimpleMovingAverage([USEquityPricing.high], window_length=5)
@@ -389,8 +448,8 @@ class ExecutionPlan(TermGraph):
 
         See Also
         --------
-        zipline.pipeline.graph.TermGraph.offset
-        zipline.pipeline.term.Term.dependencies
+        :meth:`zipline.pipeline.graph.ExecutionPlan.offset`
+        :meth:`zipline.pipeline.Term.dependencies`
         """
         return {
             term: attrs['extra_rows']
@@ -440,3 +499,20 @@ class ExecutionPlan(TermGraph):
         )
 
         return workspace[mask][mask_offset:], all_dates[dates_offset:]
+
+    def _assert_all_loadable_terms_specialized_to(self, domain):
+        """Make sure that we've specialized all loadable terms in the graph.
+        """
+        for term in self.graph.node:
+            if isinstance(term, LoadableTerm):
+                assert term.domain is domain
+
+
+# XXX: This function exists because we currently only specialize LoadableTerms
+#      when running a Pipeline on a given domain.
+def maybe_specialize(term, domain):
+    """Specialize a term if it's loadable.
+    """
+    if isinstance(term, LoadableTerm):
+        return term.specialize(domain)
+    return term

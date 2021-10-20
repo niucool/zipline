@@ -1,13 +1,14 @@
 import sys
 import os
 
-from zipline import __version__ as version
-
 # If extensions (or modules to document with autodoc) are in another directory,
 # add these directories to sys.path here. If the directory is relative to the
 # documentation root, use os.path.abspath to make it absolute, like shown here.
 sys.path.insert(0, os.path.abspath('.'))
 sys.path.insert(0, os.path.abspath('..'))
+sys.path.insert(0, os.path.abspath('../../'))
+# from zipline import __version__ as version
+
 
 extensions = [
     'sphinx.ext.autodoc',
@@ -17,6 +18,7 @@ extensions = [
     'sphinx.ext.autosummary',
     'sphinx.ext.viewcode',
     'sphinx.ext.todo',
+    'nbsphinx'
 ]
 
 
@@ -27,7 +29,7 @@ extlinks = {
 
 # -- Docstrings ---------------------------------------------------------------
 
-extensions += ['numpydoc']
+extensions += ['sphinx.ext.napoleon']
 numpydoc_show_class_members = False
 
 # Add any paths that contain templates here, relative to this directory.
@@ -40,11 +42,12 @@ source_suffix = '.rst'
 master_doc = 'index'
 
 # General information about the project.
-project = u'Zipline'
-copyright = u'2016, Quantopian Inc.'
+project = u'Zipline Trader'
+copyright = u'2020, Quantopian Inc.'
 
 # The full version, including alpha/beta/rc tags, but excluding the commit hash
-release = version.split('+', 1)[0]
+# version = release = version.split('+', 1)[0]
+version = release = "1.6.0"
 
 # List of patterns, relative to source directory, that match files and
 # directories to ignore when looking for source files.
@@ -72,7 +75,7 @@ highlight_language = 'python'
 # Add any paths that contain custom static files (such as style sheets) here,
 # relative to this directory. They are copied after the builtin static files,
 # so a file named "default.css" will overwrite the builtin "default.css".
-html_static_path = ['.static']
+html_static_path = []
 
 # If false, no index is generated.
 html_use_index = True
@@ -87,10 +90,10 @@ html_show_copyright = True
 htmlhelp_basename = 'ziplinedoc'
 
 intersphinx_mapping = {
-    'http://docs.python.org/dev': None,
-    'numpy': ('http://docs.scipy.org/doc/numpy/', None),
-    'scipy': ('http://docs.scipy.org/doc/scipy/reference/', None),
-    'pandas': ('http://pandas.pydata.org/pandas-docs/stable/', None),
+    'https://docs.python.org/dev/': None,
+    'numpy': ('https://numpy.org/doc/stable/', None),
+    'scipy': ('https://docs.scipy.org/doc/scipy/reference/', None),
+    'pandas': ('https://pandas.pydata.org/pandas-docs/stable/', None),
 }
 
 doctest_global_setup = "import zipline"

@@ -3,10 +3,11 @@ Tests for Factor terms.
 """
 from functools import partial
 from itertools import product
-from nose_parameterized import parameterized
-from unittest import TestCase
+from parameterized import parameterized
+from unittest import TestCase, skipIf
 
 from toolz import compose
+import numpy as np
 from numpy import (
     apply_along_axis,
     arange,
@@ -14,9 +15,11 @@ from numpy import (
     datetime64,
     empty,
     eye,
+    inf,
     log1p,
     nan,
     ones,
+    ones_like,
     rot90,
     where,
 )
@@ -28,10 +31,17 @@ from zipline.errors import BadPercentileBounds, UnknownRankMethod
 from zipline.lib.labelarray import LabelArray
 from zipline.lib.rank import masked_rankdata_2d
 from zipline.lib.normalize import naive_grouped_rowwise_apply as grouped_apply
-from zipline.pipeline import Classifier, Factor, Filter
+from zipline.pipeline import Classifier, Factor, Filter, Pipeline
+from zipline.pipeline.data import DataSet, Column, EquityPricing
 from zipline.pipeline.factors import (
+    CustomFactor,
+    DailyReturns,
     Returns,
-    RSI,
+    PercentChange,
+)
+from zipline.pipeline.factors.factor import (
+    summary_funcs,
+    winsorize as zp_winsorize,
 )
 from zipline.testing import (
     check_allclose,
@@ -39,18 +49,24 @@ from zipline.testing import (
     parameter_space,
     permute_rows,
 )
-from zipline.testing.fixtures import ZiplineTestCase
+from zipline.testing.fixtures import (
+    WithUSEquityPricingPipelineEngine,
+    ZiplineTestCase,
+)
 from zipline.testing.predicates import assert_equal
 from zipline.utils.numpy_utils import (
+    as_column,
     categorical_dtype,
     datetime64ns_dtype,
     float64_dtype,
+    ignore_nanwarnings,
     int64_dtype,
     NaTns,
 )
 from zipline.utils.math_utils import nanmean, nanstd
+from zipline.utils.pandas_utils import new_pandas, skip_pipeline_new_pandas
 
-from .base import BasePipelineTestCase
+from .base import BaseUSEquityPipelineTestCase
 
 
 class F(Factor):
@@ -90,7 +106,40 @@ for_each_factor_dtype = parameterized.expand([
 ])
 
 
-class FactorTestCase(BasePipelineTestCase):
+def scipy_winsorize_with_nan_handling(array, limits):
+    """
+    Wrapper around scipy.stats.mstats.winsorize that handles NaNs correctly.
+
+    scipy's winsorize sorts NaNs to the end of the array when calculating
+    percentiles.
+    """
+    # The basic idea of this function is to do the following:
+    # 1. Sort the input, sorting nans to the end of the array.
+    # 2. Call scipy winsorize on the non-nan portion of the input.
+    # 3. Undo the sorting to put the winsorized values back in their original
+    #    locations.
+
+    nancount = np.isnan(array).sum()
+    if nancount == len(array):
+        return array.copy()
+
+    sorter = array.argsort()
+    unsorter = sorter.argsort()  # argsorting a permutation gives its inverse!
+
+    if nancount:
+        sorted_non_nans = array[sorter][:-nancount]
+    else:
+        sorted_non_nans = array[sorter]
+
+    sorted_winsorized = np.hstack([
+        scipy_winsorize(sorted_non_nans, limits).data,
+        np.full(nancount, np.nan),
+    ])
+
+    return sorted_winsorized[unsorter]
+
+
+class FactorTestCase(BaseUSEquityPipelineTestCase):
 
     def init_instance_fixtures(self):
         super(FactorTestCase, self).init_instance_fixtures()
@@ -521,33 +570,6 @@ class FactorTestCase(BasePipelineTestCase):
         check({'ordinal': f.rank(groupby=str_c, ascending=False)})
 
     @parameterized.expand([
-        # Test cases computed by doing:
-        # from numpy.random import seed, randn
-        # from talib import RSI
-        # seed(seed_value)
-        # data = abs(randn(15, 3))
-        # expected = [RSI(data[:, i])[-1] for i in range(3)]
-        (100, array([41.032913785966, 51.553585468393, 51.022005016446])),
-        (101, array([43.506969935466, 46.145367530182, 50.57407044197])),
-        (102, array([46.610102205934, 47.646892444315, 52.13182788538])),
-    ])
-    def test_rsi(self, seed_value, expected):
-
-        rsi = RSI()
-
-        today = datetime64(1, 'ns')
-        assets = arange(3)
-        out = empty((3,), dtype=float)
-
-        seed(seed_value)  # Seed so we get deterministic results.
-        test_data = abs(randn(15, 3))
-
-        out = empty((3,), dtype=float)
-        rsi.compute(today, assets, out, test_data)
-
-        check_allclose(expected, out)
-
-    @parameterized.expand([
         (100, 15),
         (101, 4),
         (102, 100),
@@ -558,7 +580,6 @@ class FactorTestCase(BasePipelineTestCase):
 
         today = datetime64(1, 'ns')
         assets = arange(3)
-        out = empty((3,), dtype=float)
 
         seed(seed_value)  # Seed so we get deterministic results.
         test_data = abs(randn(window_length, 3))
@@ -570,6 +591,41 @@ class FactorTestCase(BasePipelineTestCase):
         returns.compute(today, assets, out, test_data)
 
         check_allclose(expected, out)
+
+    @parameterized.expand([
+        (100, 15),
+        (101, 4),
+        (102, 100),
+        ])
+    def test_percentchange(self, seed_value, window_length):
+
+        pct_change = PercentChange(
+            inputs=[EquityPricing.close],
+            window_length=window_length,
+        )
+
+        today = datetime64(1, 'ns')
+        assets = arange(8)
+
+        seed(seed_value)  # Seed so we get deterministic results.
+        middle_rows = randn(window_length - 2, 8)
+        first_row = array([1, 2, 2, 1, -1, -1, 0, nan])
+        end_row = array([2, 1, 2, -2, 2, -2, 1, 1])
+        test_data = np.vstack([first_row, middle_rows, end_row])
+
+        # Calculate the expected percent change
+        expected = array([1, -0.5, 0, -3, 3, -1, inf, nan])
+
+        out = empty((8,), dtype=float)
+        pct_change.compute(today, assets, out, test_data)
+
+        check_allclose(expected, out)
+
+        with self.assertRaises(ValueError):
+            PercentChange(inputs=(), window_length=2)
+
+        with self.assertRaises(ValueError):
+            PercentChange(inputs=[EquityPricing.close], window_length=1)
 
     def gen_ranking_cases():
         seeds = range(int(1e4), int(1e5), int(1e4))
@@ -687,7 +743,7 @@ class FactorTestCase(BasePipelineTestCase):
                  [0.000,     nan,  1.250, -1.250],
                  [-0.500,  0.500,    nan,  0.000],
                  [-0.500,  0.500,  0.000,    nan]]
-            )
+            ),
         }
         # Changing the classifier dtype shouldn't affect anything.
         expected['grouped_str'] = expected['grouped']
@@ -720,20 +776,26 @@ class FactorTestCase(BasePipelineTestCase):
         str_c = C(dtype=categorical_dtype, missing_value=None)
 
         factor_data = array([
-            [1.,     2.,  3.,  4.,   5.,   6.],
-            [1.,     8., 27., 64., 125., 216.],
-            [6.,     5.,  4.,  3.,   2.,   1.]
+            [1.,     2.,  3.,  4.,   5.,   6.,  7.,  8.,  9.],
+            [1.,     2.,  3.,  4.,   5.,   6., nan, nan, nan],
+            [1.,     8., 27., 64., 125., 216., nan, nan, nan],
+            [6.,     5.,  4.,  3.,   2.,   1., nan, nan, nan],
+            [nan,   nan, nan, nan,  nan,  nan, nan, nan, nan],
         ])
         filter_data = array(
-            [[False, True, True, True, True, True],
-             [True, False, True, True, True, True],
-             [True, True, False, True, True, True]],
+            [[1, 1, 1, 1, 1, 1, 1, 1, 1],
+             [0, 1, 1, 1, 1, 1, 1, 1, 1],
+             [1, 0, 1, 1, 1, 1, 1, 1, 1],
+             [1, 1, 0, 1, 1, 1, 1, 1, 1],
+             [1, 1, 1, 0, 1, 1, 1, 1, 1]],
             dtype=bool,
         )
         classifier_data = array(
-            [[1, 1, 1, 2, 2, 2],
-             [1, 1, 1, 2, 2, 2],
-             [1, 1, 1, 2, 2, 2]],
+            [[1, 1, 1, 2, 2, 2, 1, 1, 1],
+             [1, 1, 1, 2, 2, 2, 1, 1, 1],
+             [1, 1, 1, 2, 2, 2, 1, 1, 1],
+             [1, 1, 1, 2, 2, 2, 1, 1, 1],
+             [1, 1, 1, 2, 2, 2, 1, 1, 1]],
             dtype=int64_dtype,
         )
         string_classifier_data = LabelArray(
@@ -784,34 +846,47 @@ class FactorTestCase(BasePipelineTestCase):
         }
         expected = {
             'winsor_1': array([
-                [2.,    2.,    3.,    4.,    5.,    5.],
-                [8.,    8.,   27.,   64.,  125.,  125.],
-                [5.,    5.,    4.,    3.,    2.,    2.]
+                [3.,    3.,    3.,    4.,    5.,    6.,  7.,  7.,  7.],
+                [2.,    2.,    3.,    4.,    5.,    5., nan, nan, nan],
+                [8.,    8.,   27.,   64.,  125.,  125., nan, nan, nan],
+                [5.,    5.,    4.,    3.,    2.,    2., nan, nan, nan],
+                [nan,  nan,   nan,   nan,   nan,   nan, nan, nan, nan],
             ]),
             'winsor_2': array([
-                [3.0,    3.,    3.,    4.,    5.,    6.],
-                [27.,   27.,   27.,   64.,  125.,  216.],
-                [6.0,    5.,    4.,    3.,    3.,    3.]
+                [5.,     5.,    5.,    5.,    5.,    6.,  7.,  8.,  9.],
+                [3.0,    3.,    3.,    4.,    5.,    6., nan, nan, nan],
+                [27.,   27.,   27.,   64.,  125.,  216., nan, nan, nan],
+                [6.0,    5.,    4.,    3.,    3.,    3., nan, nan, nan],
+                [nan,   nan,   nan,   nan,   nan,   nan, nan, nan, nan],
             ]),
             'winsor_3': array([
-                [1.,    2.,    3.,    4.,    5.,    5.],
-                [1.,    8.,   27.,   64.,  125.,  125.],
-                [5.,    5.,    4.,    3.,    2.,    1.]
+                [1.,    2.,    3.,    4.,    5.,    6.,  7.,  7.,  7.],
+                [1.,    2.,    3.,    4.,    5.,    5., nan, nan, nan],
+                [1.,    8.,   27.,   64.,  125.,  125., nan, nan, nan],
+                [5.,    5.,    4.,    3.,    2.,    1., nan, nan, nan],
+                [nan,  nan,   nan,   nan,   nan,   nan, nan, nan, nan],
             ]),
             'masked': array([
-                [nan,    3.,    3.,    4.,    5.,    5.],
-                [27.,   nan,   27.,   64.,  125.,  125.],
-                [5.0,    5.,    nan,    3.,    2.,   2.]
+                # no mask on first row
+                [3.,     3.,    3.,    4.,    5.,    6.,  7.,  7.,  7.],
+                [nan,    3.,    3.,    4.,    5.,    5., nan, nan, nan],
+                [27.,   nan,   27.,   64.,  125.,  125., nan, nan, nan],
+                [5.0,    5.,    nan,   3.,    2.,    2., nan, nan, nan],
+                [nan,   nan,   nan,   nan,   nan,   nan, nan, nan, nan],
             ]),
             'grouped': array([
-                [2.,    2.,    2.,    5.,    5.,    5.],
-                [8.,    8.,    8.,  125.,  125.,  125.],
-                [5.,    5.,    5.,    2.,    2.,    2.]
+                [3.,    3.,    3.,    5.,    5.,    5.,  7.,  7.,  7.],
+                [2.,    2.,    2.,    5.,    5.,    5., nan, nan, nan],
+                [8.,    8.,    8.,  125.,  125.,  125., nan, nan, nan],
+                [5.,    5.,    5.,    2.,    2.,    2., nan, nan, nan],
+                [nan,  nan,   nan,   nan,   nan,   nan, nan, nan, nan],
             ]),
             'grouped_masked': array([
-                [nan,    2.,    3.,    5.,    5.,    5.],
-                [1.0,   nan,   27.,  125.,  125.,  125.],
-                [6.0,    5.,    nan,    2.,    2.,   2.]
+                [3.,     3.,    3.,    5.,    5.,    5.,  7.,  7.,  7.],
+                [nan,    2.,    3.,    5.,    5.,    5., nan, nan, nan],
+                [1.0,   nan,   27.,  125.,  125.,  125., nan, nan, nan],
+                [6.0,    5.,   nan,    2.,    2.,    2., nan, nan, nan],
+                [nan,   nan,   nan,   nan,   nan,   nan, nan, nan, nan],
             ]),
         }
         # Changing the classifier dtype shouldn't affect anything.
@@ -831,6 +906,74 @@ class FactorTestCase(BasePipelineTestCase):
             check=partial(check_allclose, atol=0.001),
         )
 
+    def test_winsorize_no_nans(self):
+        data = array([0., 1., 2., 3., 4., 5., 6., 7., 8., 9.])
+        permutation = array([2, 1, 6, 8, 7, 5, 3, 9, 4, 0])
+
+        for perm in slice(None), permutation:
+            # Winsorize both tails at 90%.
+            result = zp_winsorize(data[perm], 0.1, 0.9)
+            expected = array([1., 1., 2., 3., 4., 5., 6., 7., 8., 8.])[perm]
+            assert_equal(result, expected)
+
+            # Winsorize both tails at 80%.
+            result = zp_winsorize(data[perm], 0.2, 0.8)
+            expected = array([2., 2., 2., 3., 4., 5., 6., 7., 7., 7.])[perm]
+            assert_equal(result, expected)
+
+            # Winsorize just the upper tail.
+            result = zp_winsorize(data[perm], 0.0, 0.8)
+            expected = array([0., 1., 2., 3., 4., 5., 6., 7., 7., 7.])[perm]
+            assert_equal(result, expected)
+
+            # Winsorize just the lower tail.
+            result = zp_winsorize(data[perm], 0.2, 1.0)
+            expected = array([2., 2., 2., 3., 4., 5., 6., 7., 8., 9.])[perm]
+            assert_equal(result, expected)
+
+            # Don't winsorize.
+            result = zp_winsorize(data[perm], 0.0, 1.0)
+            expected = array([0., 1., 2., 3., 4., 5., 6., 7., 8., 9.])[perm]
+            assert_equal(result, expected)
+
+    def test_winsorize_nans(self):
+        # 5 low non-nan values, then some nans, then 5 high non-nans.
+        data = array([4.0, 3.0, 0.0, 1.0, 2.0,
+                      nan, nan, nan,
+                      9.0, 5.0, 6.0, 8.0, 7.0])
+
+        # Winsorize both tails at 10%.
+        # 0.0 -> 1.0
+        # 9.0 -> 8.0
+        result = zp_winsorize(data, 0.10, 0.90)
+        expected = array([4.0, 3.0, 1.0, 1.0, 2.0,
+                          nan, nan, nan,
+                          8.0, 5.0, 6.0, 8.0, 7.0])
+        assert_equal(result, expected)
+
+        # Winsorize both tails at 20%.
+        # 0.0 and 1.0 -> 2.0
+        # 9.0 and 8.0 -> 7.0
+        result = zp_winsorize(data, 0.20, 0.80)
+        expected = array([4.0, 3.0, 2.0, 2.0, 2.0,
+                          nan, nan, nan,
+                          7.0, 5.0, 6.0, 7.0, 7.0])
+        assert_equal(result, expected)
+
+        # Winsorize just the upper tail.
+        result = zp_winsorize(data, 0, 0.8)
+        expected = array([4.0, 3.0, 0.0, 1.0, 2.0,
+                          nan, nan, nan,
+                          7.0, 5.0, 6.0, 7.0, 7.0])
+        assert_equal(result, expected)
+
+        # Winsorize just the lower tail.
+        result = zp_winsorize(data, 0.2, 1.0)
+        expected = array([4.0, 3.0, 2.0, 2.0, 2.0,
+                          nan, nan, nan,
+                          9.0, 5.0, 6.0, 8.0, 7.0])
+        assert_equal(result, expected)
+
     def test_winsorize_bad_bounds(self):
         """
         Test out of bounds input for factor.winsorize.
@@ -848,15 +991,16 @@ class FactorTestCase(BasePipelineTestCase):
             with self.assertRaises(BadPercentileBounds):
                 f.winsorize(min_percentile=min_, max_percentile=max_)
 
+    @skipIf(new_pandas, skip_pipeline_new_pandas)
     @parameter_space(
-        seed_value=range(1, 2),
+        seed_value=[1, 2],
         normalizer_name_and_func=[
             ('demean', {}, lambda row: row - nanmean(row)),
             ('zscore', {}, lambda row: (row - nanmean(row)) / nanstd(row)),
             (
                 'winsorize',
                 {"min_percentile": 0.25, "max_percentile": 0.75},
-                lambda row: scipy_winsorize(
+                lambda row: scipy_winsorize_with_nan_handling(
                     row,
                     limits=0.25,
                 )
@@ -1184,29 +1328,139 @@ class FactorTestCase(BasePipelineTestCase):
         self.assertIs(f.deciles(mask=m), f.quantiles(bins=10, mask=m))
         self.assertIsNot(f.deciles(), f.deciles(mask=m))
 
+    @parameter_space(seed=[1, 2, 3])
+    def test_clip(self, seed):
+        rand = np.random.RandomState(seed)
+        shape = (5, 5)
+        original_min = -10
+        original_max = +10
+        input_array = rand.uniform(
+            original_min,
+            original_max,
+            size=shape,
+        )
+        min_, max_ = np.percentile(input_array, [25, 75])
+        self.assertGreater(min_, original_min)
+        self.assertLess(max_, original_max)
 
-class ShortReprTestCase(TestCase):
+        f = F()
+
+        self.check_terms(
+            terms={
+                'clip': f.clip(min_, max_)
+            },
+            initial_workspace={
+                f: input_array,
+            },
+            expected={
+                'clip': np.clip(input_array, min_, max_),
+            },
+            mask=self.build_mask(self.ones_mask(shape=shape)),
+        )
+
+
+class ReprTestCase(TestCase):
     """
-    Tests for short_repr methods of Factors.
+    Tests for term reprs.
     """
 
     def test_demean(self):
-        r = F().demean().short_repr()
+        r = F().demean().graph_repr()
         self.assertEqual(r, "GroupedRowTransform('demean')")
 
     def test_zscore(self):
-        r = F().zscore().short_repr()
+        r = F().zscore().graph_repr()
         self.assertEqual(r, "GroupedRowTransform('zscore')")
 
     def test_winsorize(self):
-        r = F().winsorize(min_percentile=.05, max_percentile=.95).short_repr()
+        r = F().winsorize(min_percentile=.05, max_percentile=.95).graph_repr()
         self.assertEqual(r, "GroupedRowTransform('winsorize')")
+
+    def test_recarray_field_repr(self):
+        class MultipleOutputs(CustomFactor):
+            outputs = ['a', 'b']
+            inputs = ()
+            window_length = 5
+
+            def recursive_repr(self):
+                return "CustomRepr()"
+
+        a = MultipleOutputs().a
+        b = MultipleOutputs().b
+
+        self.assertEqual(a.graph_repr(), "CustomRepr().a")
+        self.assertEqual(b.graph_repr(), "CustomRepr().b")
+
+    def test_latest_repr(self):
+
+        class SomeDataSet(DataSet):
+            a = Column(dtype=float64_dtype)
+            b = Column(dtype=float64_dtype)
+
+        self.assertEqual(
+            SomeDataSet.a.latest.graph_repr(),
+            "Latest"
+        )
+        self.assertEqual(
+            SomeDataSet.b.latest.graph_repr(),
+            "Latest"
+        )
+
+    def test_recursive_repr(self):
+
+        class DS(DataSet):
+            a = Column(dtype=float64_dtype)
+            b = Column(dtype=float64_dtype)
+
+        class Input(CustomFactor):
+            inputs = ()
+            window_safe = True
+
+        class HasInputs(CustomFactor):
+            inputs = [Input(window_length=3), DS.a, DS.b]
+            window_length = 3
+
+        result = repr(HasInputs())
+        expected = "HasInputs([Input(...), DS.a, DS.b], 3)"
+        self.assertEqual(result, expected)
+
+    def test_rank_repr(self):
+        rank = DailyReturns().rank()
+        result = repr(rank)
+        expected = "Rank(DailyReturns(...), method='ordinal')"
+        self.assertEqual(result, expected)
+
+        recursive_repr = rank.recursive_repr()
+        self.assertEqual(recursive_repr, "Rank(...)")
+
+    def test_rank_repr_with_mask(self):
+        rank = DailyReturns().rank(mask=Mask())
+        result = repr(rank)
+        expected = "Rank(DailyReturns(...), method='ordinal', mask=Mask(...))"
+        self.assertEqual(result, expected)
+
+        recursive_repr = rank.recursive_repr()
+        self.assertEqual(recursive_repr, "Rank(...)")
 
 
 class TestWindowSafety(TestCase):
 
     def test_zscore_is_window_safe(self):
         self.assertTrue(F().zscore().window_safe)
+
+    @parameter_space(__fail_fast=True, is_window_safe=[True, False])
+    def test_window_safety_propagates_to_recarray_fields(self, is_window_safe):
+
+        class MultipleOutputs(CustomFactor):
+            outputs = ['a', 'b']
+            inputs = ()
+            window_length = 5
+            window_safe = is_window_safe
+
+        mo = MultipleOutputs()
+
+        for attr in mo.a, mo.b:
+            self.assertEqual(attr.window_safe, mo.window_safe)
 
     def test_demean_is_window_safe_if_input_is_window_safe(self):
         self.assertFalse(F().demean().window_safe)
@@ -1265,3 +1519,251 @@ class TestPostProcessAndToWorkSpaceValue(ZiplineTestCase):
             f.to_workspace_value(pipeline_output, pd.Index([0, 1])),
             column_data,
         )
+
+
+class TestSpecialCases(WithUSEquityPricingPipelineEngine,
+                       ZiplineTestCase):
+    ASSET_FINDER_COUNTRY_CODE = 'US'
+
+    def check_equivalent_terms(self, terms):
+        self.assertTrue(len(terms) > 1, "Need at least two terms to compare")
+        pipe = Pipeline(terms)
+
+        start, end = self.trading_days[[-10, -1]]
+        results = self.pipeline_engine.run_pipeline(pipe, start, end)
+        first_column = results.iloc[:, 0]
+        for name in terms:
+            assert_equal(results.loc[:, name], first_column, check_names=False)
+
+    def test_daily_returns_is_special_case_of_returns(self):
+        self.check_equivalent_terms({
+            'daily': DailyReturns(),
+            'manual_daily': Returns(window_length=2),
+        })
+
+
+class SummaryTestCase(BaseUSEquityPipelineTestCase, ZiplineTestCase):
+
+    @parameter_space(
+        seed=[1, 2, 3],
+        mask=[
+            np.zeros((10, 5), dtype=bool),
+            ones((10, 5), dtype=bool),
+            eye(10, 5, dtype=bool),
+            ~eye(10, 5, dtype=bool),
+        ]
+    )
+    def test_summary_methods(self, seed, mask):
+        """Test that summary funcs work the same as numpy NaN-aware funcs.
+        """
+        rand = np.random.RandomState(seed)
+        shape = (10, 5)
+        data = rand.randn(*shape)
+        data[~mask] = np.nan
+
+        workspace = {F(): data}
+        terms = {
+            'mean': F().mean(),
+            'sum': F().sum(),
+            'median': F().median(),
+            'min': F().min(),
+            'max': F().max(),
+            'stddev': F().stddev(),
+            'notnull_count': F().notnull_count(),
+        }
+
+        with ignore_nanwarnings():
+            expected = {
+                'mean': as_column(np.nanmean(data, axis=1)),
+                'sum': as_column(np.nansum(data, axis=1)),
+                'median': as_column(np.nanmedian(data, axis=1)),
+                'min': as_column(np.nanmin(data, axis=1)),
+                'max': as_column(np.nanmax(data, axis=1)),
+                'stddev': as_column(np.nanstd(data, axis=1)),
+                'notnull_count': as_column((~np.isnan(data)).sum(axis=1)),
+            }
+
+        # Make sure we have test coverage for all summary funcs.
+        self.assertEqual(set(expected), summary_funcs.names)
+
+        self.check_terms(
+            terms=terms,
+            expected=expected,
+            initial_workspace=workspace,
+            mask=self.build_mask(ones(shape)),
+        )
+
+    @parameter_space(
+        seed=[4, 5, 6],
+        mask=[
+            np.zeros((10, 5), dtype=bool),
+            ones((10, 5), dtype=bool),
+            eye(10, 5, dtype=bool),
+            ~eye(10, 5, dtype=bool),
+        ]
+    )
+    def test_built_in_vs_summary(self, seed, mask):
+        """Test that summary funcs match normalization functions.
+        """
+        rand = np.random.RandomState(seed)
+        shape = (10, 5)
+        data = rand.randn(*shape)
+        data[~mask] = np.nan
+
+        workspace = {F(): data}
+        terms = {
+            'demean': F().demean(),
+            'alt_demean': F() - F().mean(),
+
+            'zscore': F().zscore(),
+            'alt_zscore': (F() - F().mean()) / F().stddev(),
+
+            'mean': F().mean(),
+            'alt_mean': F().sum() / F().notnull_count(),
+        }
+
+        result = self.run_terms(
+            terms,
+            initial_workspace=workspace,
+            mask=self.build_mask(ones(shape)),
+        )
+
+        assert_equal(result['demean'], result['alt_demean'])
+        assert_equal(result['zscore'], result['alt_zscore'])
+
+    @parameter_space(
+        seed=[100, 200, 300],
+        mask=[
+            np.zeros((10, 5), dtype=bool),
+            ones((10, 5), dtype=bool),
+            eye(10, 5, dtype=bool),
+            ~eye(10, 5, dtype=bool),
+        ]
+    )
+    def test_complex_expression(self, seed, mask):
+        rand = np.random.RandomState(seed)
+        shape = (10, 5)
+        data = rand.randn(*shape)
+        data[~mask] = np.nan
+
+        workspace = {F(): data}
+        terms = {
+            'rescaled': (F() - F().min()) / (F().max() - F().min()),
+        }
+
+        with ignore_nanwarnings():
+            mins = as_column(np.nanmin(data, axis=1))
+            maxes = as_column(np.nanmax(data, axis=1))
+
+        expected = {
+            'rescaled': (data - mins) / (maxes - mins),
+        }
+
+        self.check_terms(
+            terms,
+            expected,
+            initial_workspace=workspace,
+            mask=self.build_mask(ones(shape)),
+        )
+
+    @parameter_space(
+        seed=[40, 41, 42],
+        mask=[
+            np.zeros((10, 5), dtype=bool),
+            ones((10, 5), dtype=bool),
+            eye(10, 5, dtype=bool),
+            ~eye(10, 5, dtype=bool),
+        ],
+        # Three ways to mask:
+        # 1. Don't mask.
+        # 2. Mask by passing mask parameter to summary methods.
+        # 3. Mask by having non-True values in the root mask.
+        mask_mode=('none', 'param', 'root'),
+    )
+    def test_summaries_after_fillna(self, seed, mask, mask_mode):
+        rand = np.random.RandomState(seed)
+        shape = (10, 5)
+
+        # Create data with a mix of NaN and non-NaN values.
+        with_nans = np.where(mask, rand.randn(*shape), np.nan)
+
+        # Create a version with NaNs filled with -1s.
+        with_minus_1s = np.where(mask, with_nans, -1)
+
+        kwargs = {}
+        workspace = {F(): with_nans}
+
+        # Call each summary method with mask=Mask().
+        if mask_mode == 'param':
+            kwargs['mask'] = Mask()
+            workspace[Mask()] = mask
+
+        # Take the mean after applying a fillna of -1 to ensure that we ignore
+        # masked locations properly.
+        terms = {
+            'mean': F().fillna(-1).mean(**kwargs),
+            'sum': F().fillna(-1).sum(**kwargs),
+            'median': F().fillna(-1).median(**kwargs),
+            'min': F().fillna(-1).min(**kwargs),
+            'max': F().fillna(-1).max(**kwargs),
+            'stddev': F().fillna(-1).stddev(**kwargs),
+            'notnull_count': F().fillna(-1).notnull_count(**kwargs),
+        }
+
+        with ignore_nanwarnings():
+            if mask_mode == 'none':
+                # If we aren't masking, we should expect the results to see the
+                # -1s.
+                expected_input = with_minus_1s
+            else:
+                # If we are masking, we should expect the results to see NaNs.
+                expected_input = with_nans
+
+            expected = {
+                'mean': as_column(np.nanmean(expected_input, axis=1)),
+                'sum': as_column(np.nansum(expected_input, axis=1)),
+                'median': as_column(np.nanmedian(expected_input, axis=1)),
+                'min': as_column(np.nanmin(expected_input, axis=1)),
+                'max': as_column(np.nanmax(expected_input, axis=1)),
+                'stddev': as_column(np.nanstd(expected_input, axis=1)),
+                'notnull_count': as_column(
+                    (~np.isnan(expected_input)).sum(axis=1),
+                ),
+            }
+
+        # Make sure we have test coverage for all summary funcs.
+        self.assertEqual(set(expected), summary_funcs.names)
+
+        if mask_mode == 'root':
+            root_mask = self.build_mask(mask)
+        else:
+            root_mask = self.build_mask(ones_like(mask))
+
+        self.check_terms(
+            terms=terms,
+            expected=expected,
+            initial_workspace=workspace,
+            mask=root_mask,
+        )
+
+    def test_repr(self):
+
+        class MyFactor(CustomFactor):
+            window_length = 1
+            inputs = ()
+
+            def recursive_repr(self):
+                return "MyFactor()"
+
+        f = MyFactor()
+
+        for method in summary_funcs.names:
+            summarized = getattr(f, method)()
+            self.assertEqual(
+                repr(summarized),
+                "MyFactor().{}()".format(method),
+            )
+            self.assertEqual(
+                summarized.recursive_repr(),
+                "MyFactor().{}()".format(method),
+            )

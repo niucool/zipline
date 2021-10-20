@@ -1,5 +1,5 @@
 from textwrap import dedent
-
+from functools import partial
 from numpy import (
     bool_,
     dtype,
@@ -13,6 +13,8 @@ from numpy import (
     uint32,
     uint8,
 )
+from six import iteritems
+from toolz import merge_with
 from zipline.errors import (
     WindowLengthNotPositive,
     WindowLengthTooLong,
@@ -33,9 +35,8 @@ from ._labelwindow import AdjustedArrayWindow as LabelWindow
 from ._uint8window import AdjustedArrayWindow as UInt8Window
 
 
-NOMASK = None
 BOOL_DTYPES = frozenset(
-    map(dtype, [bool_]),
+    map(dtype, [bool_, uint8]),
 )
 FLOAT_DTYPES = frozenset(
     map(dtype, [float32, float64]),
@@ -98,17 +99,19 @@ def _normalize_array(data, missing_value):
     Returns
     -------
     coerced, view_kwargs : (np.ndarray, np.dtype)
+        The input ``data`` array coerced to the appropriate pipeline type.
+        This may return the original array or a view over the same data.
     """
     if isinstance(data, LabelArray):
         return data, {}
 
     data_dtype = data.dtype
-    if data_dtype == bool_:
-        return data.astype(uint8), {'dtype': dtype(bool_)}
+    if data_dtype in BOOL_DTYPES:
+        return data.astype(uint8, copy=False), {'dtype': dtype(bool_)}
     elif data_dtype in FLOAT_DTYPES:
-        return data.astype(float64), {'dtype': dtype(float64)}
+        return data.astype(float64, copy=False), {'dtype': dtype(float64)}
     elif data_dtype in INT_DTYPES:
-        return data.astype(int64), {'dtype': dtype(int64)}
+        return data.astype(int64, copy=False), {'dtype': dtype(int64)}
     elif is_categorical(data_dtype):
         if not isinstance(missing_value, LabelArray.SUPPORTED_SCALAR_TYPES):
             raise TypeError(
@@ -118,7 +121,7 @@ def _normalize_array(data, missing_value):
         return LabelArray(data, missing_value), {}
     elif data_dtype.kind == 'M':
         try:
-            outarray = data.astype('datetime64[ns]').view('int64')
+            outarray = data.astype('datetime64[ns]', copy=False).view('int64')
             return outarray, {'dtype': datetime64ns_dtype}
         except OverflowError:
             raise ValueError(
@@ -135,6 +138,46 @@ def _normalize_array(data, missing_value):
         )
 
 
+def _merge_simple(adjustment_lists, front_idx, back_idx):
+    """
+    Merge lists of new and existing adjustments for a given index by appending
+    or prepending new adjustments to existing adjustments.
+
+    Notes
+    -----
+    This method is meant to be used with ``toolz.merge_with`` to merge
+    adjustment mappings. In case of a collision ``adjustment_lists`` contains
+    two lists, existing adjustments at index 0 and new adjustments at index 1.
+    When there are no collisions, ``adjustment_lists`` contains a single list.
+
+    Parameters
+    ----------
+    adjustment_lists : list[list[Adjustment]]
+        List(s) of new and/or existing adjustments for a given index.
+    front_idx : int
+        Index of list in ``adjustment_lists`` that should be used as baseline
+        in case of a collision.
+    back_idx : int
+        Index of list in ``adjustment_lists`` that should extend baseline list
+        in case of a collision.
+
+    Returns
+    -------
+    adjustments : list[Adjustment]
+        List of merged adjustments for a given index.
+    """
+    if len(adjustment_lists) == 1:
+        return list(adjustment_lists[0])
+    else:
+        return adjustment_lists[front_idx] + adjustment_lists[back_idx]
+
+
+_merge_methods = {
+    'append': partial(_merge_simple, front_idx=0, back_idx=1),
+    'prepend': partial(_merge_simple, front_idx=1, back_idx=0),
+}
+
+
 class AdjustedArray(object):
     """
     An array that can be iterated with a variable-length window, and which can
@@ -143,9 +186,8 @@ class AdjustedArray(object):
     Parameters
     ----------
     data : np.ndarray
-        The baseline data values.
-    mask : np.ndarray[bool]
-        A mask indicating the locations of missing data.
+        The baseline data values. This array may be mutated by
+        ``traverse(..., copy=False)`` calls.
     adjustments : dict[int -> list[Adjustment]]
         A dict mapping row indices to lists of adjustments to apply when we
         reach that row.
@@ -158,26 +200,58 @@ class AdjustedArray(object):
         '_view_kwargs',
         'adjustments',
         'missing_value',
+        '_invalidated',
         '__weakref__',
     )
 
-    def __init__(self, data, mask, adjustments, missing_value):
+    def __init__(self, data, adjustments, missing_value):
         self._data, self._view_kwargs = _normalize_array(data, missing_value)
-
         self.adjustments = adjustments
         self.missing_value = missing_value
+        self._invalidated = False
 
-        if mask is not NOMASK:
-            if mask.dtype != bool_:
-                raise ValueError("Mask must be a bool array.")
-            if data.shape != mask.shape:
-                raise ValueError(
-                    "Mask shape %s != data shape %s." %
-                    (mask.shape, data.shape),
-                )
-            self._data[~mask] = self.missing_value
+    def copy(self):
+        """Copy an adjusted array, deep-copying the ``data`` array.
+        """
+        if self._invalidated:
+            raise ValueError('cannot copy invalidated AdjustedArray')
 
-    @lazyval
+        return type(self)(
+            self.data.copy(order='F'),
+            self.adjustments,
+            self.missing_value,
+        )
+
+    def update_adjustments(self, adjustments, method):
+        """
+        Merge ``adjustments`` with existing adjustments, handling index
+        collisions according to ``method``.
+
+        Parameters
+        ----------
+        adjustments : dict[int -> list[Adjustment]]
+            The mapping of row indices to lists of adjustments that should be
+            appended to existing adjustments.
+        method : {'append', 'prepend'}
+            How to handle index collisions. If 'append', new adjustments will
+            be applied after previously-existing adjustments. If 'prepend', new
+            adjustments will be applied before previously-existing adjustments.
+        """
+        try:
+            merge_func = _merge_methods[method]
+        except KeyError:
+            raise ValueError(
+                "Invalid merge method %s\n"
+                "Valid methods are: %s" % (method, ', '.join(_merge_methods))
+            )
+
+        self.adjustments = merge_with(
+            merge_func,
+            self.adjustments,
+            adjustments,
+        )
+
+    @property
     def data(self):
         """
         The data stored in this array.
@@ -203,7 +277,8 @@ class AdjustedArray(object):
     def traverse(self,
                  window_length,
                  offset=0,
-                 perspective_offset=0):
+                 perspective_offset=0,
+                 copy=True):
         """
         Produce an iterator rolling windows rows over our data.
         Each emitted window will have `window_length` rows.
@@ -217,8 +292,19 @@ class AdjustedArray(object):
         perspective_offset : int, optional
             Number of rows past the end of the current window from which to
             "view" the underlying data.
+        copy : bool, optional
+            Copy the underlying data. If ``copy=False``, the adjusted array
+            will be invalidated and cannot be traversed again.
         """
-        data = self._data.copy()
+        if self._invalidated:
+            raise ValueError('cannot traverse invalidated AdjustedArray')
+
+        data = self._data
+        if copy:
+            data = data.copy(order='F')
+        else:
+            self._invalidated = True
+
         _check_window_params(data, window_length)
         return self._iterator_type(
             data,
@@ -250,13 +336,32 @@ class AdjustedArray(object):
             adjustments=self.adjustments,
         )
 
+    def update_labels(self, func):
+        """
+        Map a function over baseline and adjustment values in place.
+
+        Note that the baseline data values must be a LabelArray.
+        """
+        if not isinstance(self.data, LabelArray):
+            raise TypeError(
+                'update_labels only supported if data is of type LabelArray.'
+            )
+
+        # Map the baseline values.
+        self._data = self._data.map(func)
+
+        # Map each of the adjustments.
+        for _, row_adjustments in iteritems(self.adjustments):
+            for adjustment in row_adjustments:
+                adjustment.value = func(adjustment.value)
+
 
 def ensure_adjusted_array(ndarray_or_adjusted_array, missing_value):
     if isinstance(ndarray_or_adjusted_array, AdjustedArray):
         return ndarray_or_adjusted_array
     elif isinstance(ndarray_or_adjusted_array, ndarray):
         return AdjustedArray(
-            ndarray_or_adjusted_array, NOMASK, {}, missing_value,
+            ndarray_or_adjusted_array, {}, missing_value,
         )
     else:
         raise TypeError(

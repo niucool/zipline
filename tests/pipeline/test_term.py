@@ -8,13 +8,14 @@ from unittest import TestCase
 from toolz import assoc
 import pandas as pd
 
-from zipline.assets import Asset
+from zipline.assets import Asset, ExchangeInfo
 from zipline.errors import (
     DTypeNotSpecified,
     InvalidOutputName,
     NonWindowSafeInput,
     NotDType,
     TermInputsNotSpecified,
+    NonPipelineInputs,
     TermOutputsEmpty,
     UnsupportedDType,
     WindowLengthNotSpecified,
@@ -29,10 +30,11 @@ from zipline.pipeline import (
 )
 from zipline.pipeline.data import Column, DataSet
 from zipline.pipeline.data.testing import TestingDataSet
+from zipline.pipeline.domain import US_EQUITIES
 from zipline.pipeline.expression import NUMEXPR_MATH_FUNCS
 from zipline.pipeline.factors import RecarrayField
 from zipline.pipeline.sentinels import NotSpecified
-from zipline.pipeline.term import AssetExists, Slice
+from zipline.pipeline.term import AssetExists, LoadableTerm
 from zipline.testing import parameter_space
 from zipline.testing.fixtures import WithTradingSessions, ZiplineTestCase
 from zipline.testing.predicates import (
@@ -147,8 +149,8 @@ def to_dict(l):
     """
     Convert a list to a dict with keys drawn from '0', '1', '2', ...
 
-    Example
-    -------
+    Examples
+    --------
     >>> to_dict([2, 3, 4])  # doctest: +SKIP
     {'0': 2, '1': 3, '2': 4}
     """
@@ -164,21 +166,28 @@ class DependencyResolutionTestCase(WithTradingSessions, ZiplineTestCase):
     execution_plan_start = pd.Timestamp('2014-06-01', tz='UTC')
     execution_plan_end = pd.Timestamp('2014-06-30', tz='UTC')
 
+    DOMAIN = US_EQUITIES
+
     def check_dependency_order(self, ordered_terms):
         seen = set()
 
         for term in ordered_terms:
             for dep in term.dependencies:
-                self.assertIn(dep, seen)
+                # LoadableTerms should be specialized do the domain of
+                # execution when emitted by an execution plan.
+                if isinstance(dep, LoadableTerm):
+                    self.assertIn(dep.specialize(self.DOMAIN), seen)
+                else:
+                    self.assertIn(dep, seen)
 
             seen.add(term)
 
     def make_execution_plan(self, terms):
         return ExecutionPlan(
-            terms,
-            self.nyse_sessions,
-            self.execution_plan_start,
-            self.execution_plan_end,
+            domain=self.DOMAIN,
+            terms=terms,
+            start_date=self.execution_plan_start,
+            end_date=self.execution_plan_end,
         )
 
     def test_single_factor(self):
@@ -189,20 +198,22 @@ class DependencyResolutionTestCase(WithTradingSessions, ZiplineTestCase):
 
             resolution_order = list(graph.ordered())
 
+            # Loadable terms should get specialized during graph construction.
+            specialized_foo = SomeDataSet.foo.specialize(self.DOMAIN)
+            specialized_bar = SomeDataSet.foo.specialize(self.DOMAIN)
+
             self.assertEqual(len(resolution_order), 4)
             self.check_dependency_order(resolution_order)
             self.assertIn(AssetExists(), resolution_order)
-            self.assertIn(SomeDataSet.foo, resolution_order)
-            self.assertIn(SomeDataSet.bar, resolution_order)
+            self.assertIn(specialized_foo, resolution_order)
+            self.assertIn(specialized_bar, resolution_order)
             self.assertIn(SomeFactor(), resolution_order)
 
             self.assertEqual(
-                graph.graph.node[SomeDataSet.foo]['extra_rows'],
-                4,
+                graph.graph.node[specialized_foo]['extra_rows'], 4,
             )
             self.assertEqual(
-                graph.graph.node[SomeDataSet.bar]['extra_rows'],
-                4,
+                graph.graph.node[specialized_bar]['extra_rows'], 4,
             )
 
         for foobar in gen_equivalent_factors():
@@ -226,12 +237,18 @@ class DependencyResolutionTestCase(WithTradingSessions, ZiplineTestCase):
         self.assertIn(AssetExists(), resolution_order)
         self.assertEqual(graph.extra_rows[AssetExists()], 4)
 
-        self.assertIn(bar, resolution_order)
-        self.assertIn(buzz, resolution_order)
+        # LoadableTerms should be specialized to our domain in the execution
+        # order.
+        self.assertIn(bar.specialize(self.DOMAIN), resolution_order)
+        self.assertIn(buzz.specialize(self.DOMAIN), resolution_order)
+
+        # ComputableTerms don't yet have a notion of specialization, so they
+        # shouldn't appear unchanged in the execution order.
         self.assertIn(SomeFactor([bar, buzz], window_length=5),
                       resolution_order)
-        self.assertEqual(graph.extra_rows[bar], 4)
-        self.assertEqual(graph.extra_rows[buzz], 4)
+
+        self.assertEqual(graph.extra_rows[bar.specialize(self.DOMAIN)], 4)
+        self.assertEqual(graph.extra_rows[bar.specialize(self.DOMAIN)], 4)
 
     def test_reuse_loadable_terms(self):
         """
@@ -252,6 +269,16 @@ class DependencyResolutionTestCase(WithTradingSessions, ZiplineTestCase):
 
         with self.assertRaises(NonWindowSafeInput):
             SomeFactor(inputs=[SomeFactor(), SomeDataSet.foo])
+
+    def test_window_safety_one_window_length(self):
+        """
+        Test that window safety problems are only raised if
+        the parent factor has window length greater than 1
+        """
+        with self.assertRaises(NonWindowSafeInput):
+            SomeFactor(inputs=[SomeOtherFactor()])
+
+        SomeFactor(inputs=[SomeOtherFactor()], window_length=1)
 
 
 class ObjectIdentityTestCase(TestCase):
@@ -316,19 +343,22 @@ class ObjectIdentityTestCase(TestCase):
         self.assertIs(beta, multiple_outputs.beta)
 
     def test_instance_caching_of_slices(self):
-        my_asset = Asset(1, exchange="TEST")
+        my_asset = Asset(
+            1,
+            exchange_info=ExchangeInfo('TEST FULL', 'TEST', 'US'),
+        )
 
         f = GenericCustomFactor()
         f_slice = f[my_asset]
-        self.assertIs(f_slice, Slice(GenericCustomFactor(), my_asset))
+        self.assertIs(f_slice, type(f_slice)(GenericCustomFactor(), my_asset))
 
-        f = GenericFilter()
-        f_slice = f[my_asset]
-        self.assertIs(f_slice, Slice(GenericFilter(), my_asset))
+        filt = GenericFilter()
+        filt_slice = filt[my_asset]
+        self.assertIs(filt_slice, type(filt_slice)(GenericFilter(), my_asset))
 
         c = GenericClassifier()
         c_slice = c[my_asset]
-        self.assertIs(c_slice, Slice(GenericClassifier(), my_asset))
+        self.assertIs(c_slice, type(c_slice)(GenericClassifier(), my_asset))
 
     def test_instance_non_caching(self):
 
@@ -544,6 +574,9 @@ class ObjectIdentityTestCase(TestCase):
 
         with self.assertRaises(TermInputsNotSpecified):
             SomeFactorDefaultLength()
+
+        with self.assertRaises(NonPipelineInputs):
+            SomeFactor(window_length=1, inputs=[2])
 
         with self.assertRaises(WindowLengthNotSpecified):
             SomeFactor(inputs=(SomeDataSet.foo,))

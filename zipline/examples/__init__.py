@@ -2,24 +2,25 @@ from importlib import import_module
 import os
 
 from toolz import merge
+from trading_calendars import register_calendar, get_calendar
 
 from zipline import run_algorithm
 
 
 # These are used by test_examples.py to discover the examples to run.
-from zipline.utils.calendars import register_calendar, get_calendar
+def load_example_modules():
+    example_modules = {}
+    for f in os.listdir(os.path.dirname(__file__)):
+        if not f.endswith('.py') or f == '__init__.py':
+            continue
+        modname = f[:-len('.py')]
+        mod = import_module('.' + modname, package=__name__)
+        example_modules[modname] = mod
+        globals()[modname] = mod
 
-EXAMPLE_MODULES = {}
-for f in os.listdir(os.path.dirname(__file__)):
-    if not f.endswith('.py') or f == '__init__.py':
-        continue
-    modname = f[:-len('.py')]
-    mod = import_module('.' + modname, package=__name__)
-    EXAMPLE_MODULES[modname] = mod
-    globals()[modname] = mod
-
-    # Remove noise from loop variables.
-    del f, modname, mod
+        # Remove noise from loop variables.
+        del f, modname, mod
+    return example_modules
 
 
 # Columns that we expect to be able to reliably deterministic
@@ -62,11 +63,12 @@ _cols_to_check = [
 ]
 
 
-def run_example(example_name, environ):
+def run_example(example_modules, example_name, environ,
+                benchmark_returns=None):
     """
     Run an example module from zipline.examples.
     """
-    mod = EXAMPLE_MODULES[example_name]
+    mod = example_modules[example_name]
 
     register_calendar("YAHOO", get_calendar("NYSE"), force=True)
 
@@ -77,6 +79,7 @@ def run_example(example_name, environ):
         analyze=getattr(mod, 'analyze', None),
         bundle='test',
         environ=environ,
+        benchmark_returns=benchmark_returns,
         # Provide a default capital base, but allow the test to override.
         **merge({'capital_base': 1e7}, mod._test_args())
     )

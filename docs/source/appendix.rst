@@ -162,6 +162,14 @@ Miscellaneous
 
 .. autofunction:: zipline.api.fetch_csv
 
+Blotters
+~~~~~~~~
+
+.. autoclass:: zipline.finance.blotter.blotter.Blotter
+   :members:
+
+.. autoclass:: zipline.finance.blotter.SimulationBlotter
+   :members:
 
 .. _pipeline-api:
 
@@ -176,14 +184,68 @@ Pipeline API
    :members:
    :member-order: groupwise
 
-.. autoclass:: zipline.pipeline.factors.Factor
-   :members: top, bottom, rank, percentile_between, isnan, notnan, isfinite,
-             eq, __add__, __sub__, __mul__, __div__, __mod__, __pow__, __lt__,
-             __le__, __ne__, __ge__, __gt__
+.. autoclass:: zipline.pipeline.Filter
+   :members: __and__, __or__, if_else
+   :exclude-members: dtype
+
+.. autoclass:: zipline.pipeline.Factor
+   :members: bottom, deciles, demean, linear_regression, pearsonr,
+             percentile_between, quantiles, quartiles, quintiles, rank,
+             spearmanr, top, winsorize, zscore, isnan, notnan, isfinite, eq,
+             __add__, __sub__, __mul__, __div__, __mod__, __pow__, __lt__,
+             __le__, __ne__, __ge__, __gt__, clip, fillna, mean, stddev, max,
+             min, median, sum, clip
    :exclude-members: dtype
    :member-order: bysource
 
+.. autoclass:: zipline.pipeline.Term
+   :members:
+   :exclude-members: compute_extra_rows, dependencies, inputs, mask, windowed
+
+.. autoclass:: zipline.pipeline.data.DataSet
+   :members:
+
+.. autoclass:: zipline.pipeline.data.Column
+   :members:
+
+.. autoclass:: zipline.pipeline.data.BoundColumn
+   :members:
+
+.. autoclass:: zipline.pipeline.data.DataSetFamily
+   :members:
+
+.. autoclass:: zipline.pipeline.data.EquityPricing
+   :members: open, high, low, close, volume
+   :undoc-members:
+
+Built-in Factors
+````````````````
+
+.. autoclass:: zipline.pipeline.factors.AverageDollarVolume
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.BollingerBands
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.BusinessDaysSincePreviousEvent
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.BusinessDaysUntilNextEvent
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.DailyReturns
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.ExponentialWeightedMovingAverage
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.ExponentialWeightedMovingStdDev
+   :members:
+
 .. autoclass:: zipline.pipeline.factors.Latest
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.MACDSignal
    :members:
 
 .. autoclass:: zipline.pipeline.factors.MaxDrawdown
@@ -192,13 +254,25 @@ Pipeline API
 .. autoclass:: zipline.pipeline.factors.Returns
    :members:
 
+.. autoclass:: zipline.pipeline.factors.RollingPearson
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.RollingSpearman
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.RollingLinearRegressionOfReturns
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.RollingPearsonOfReturns
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.RollingSpearmanOfReturns
+   :members:
+
+.. autoclass:: zipline.pipeline.factors.SimpleBeta
+   :members:
+
 .. autoclass:: zipline.pipeline.factors.RSI
-   :members:
-
-.. autoclass:: zipline.pipeline.factors.BusinessDaysUntilNextEarnings
-   :members:
-
-.. autoclass:: zipline.pipeline.factors.BusinessDaysSincePreviousEarnings
    :members:
 
 .. autoclass:: zipline.pipeline.factors.SimpleMovingAverage
@@ -210,39 +284,56 @@ Pipeline API
 .. autoclass:: zipline.pipeline.factors.WeightedAverageValue
    :members:
 
-.. autoclass:: zipline.pipeline.factors.ExponentialWeightedMovingAverage
+.. autoclass:: zipline.pipeline.factors.PercentChange
    :members:
 
-.. autoclass:: zipline.pipeline.factors.ExponentialWeightedMovingStdDev
+.. autoclass:: zipline.pipeline.factors.PeerCount
    :members:
 
-.. autoclass:: zipline.pipeline.factors.AverageDollarVolume
+
+Built-in Filters
+````````````````
+
+.. autoclass:: zipline.pipeline.filters.All
    :members:
 
-.. autoclass:: zipline.pipeline.factors.BollingerBands
+.. autoclass:: zipline.pipeline.filters.AllPresent
    :members:
 
-.. autoclass:: zipline.pipeline.factors.RollingPearsonOfReturns
+.. autoclass:: zipline.pipeline.filters.Any
    :members:
 
-.. autoclass:: zipline.pipeline.factors.RollingSpearmanOfReturns
+.. autoclass:: zipline.pipeline.filters.AtLeastN
    :members:
 
-.. autoclass:: zipline.pipeline.factors.RollingLinearRegressionOfReturns
+.. autoclass:: zipline.pipeline.filters.SingleAsset
    :members:
 
-.. autoclass:: zipline.pipeline.filters.Filter
-   :members: __and__, __or__
-   :exclude-members: dtype
+.. autoclass:: zipline.pipeline.filters.StaticAssets
+   :members:
 
-.. autoclass:: zipline.pipeline.data.EarningsCalendar
-   :members: next_announcement, previous_announcement
-   :undoc-members:
+.. autoclass:: zipline.pipeline.filters.StaticSids
+   :members:
 
-.. autoclass:: zipline.pipeline.data.USEquityPricing
-   :members: open, high, low, close, volume
-   :undoc-members:
+Pipeline Engine
+```````````````
 
+.. autoclass:: zipline.pipeline.engine.PipelineEngine
+   :members: run_pipeline, run_chunked_pipeline
+   :member-order: bysource
+
+.. autoclass:: zipline.pipeline.engine.SimplePipelineEngine
+   :members: __init__, run_pipeline, run_chunked_pipeline
+   :member-order: bysource
+
+.. autofunction:: zipline.pipeline.engine.default_populate_initial_workspace
+
+Data Loaders
+````````````
+
+.. autoclass:: zipline.pipeline.loaders.equity_pricing_loader.USEquityPricingLoader
+   :members: __init__, from_files, load_adjusted_array
+   :member-order: bysource
 
 Asset Metadata
 ~~~~~~~~~~~~~~
@@ -285,10 +376,10 @@ Writers
 .. autoclass:: zipline.data.minute_bars.BcolzMinuteBarWriter
    :members:
 
-.. autoclass:: zipline.data.us_equity_pricing.BcolzDailyBarWriter
+.. autoclass:: zipline.data.bcolz_daily_bars.BcolzDailyBarWriter
    :members:
 
-.. autoclass:: zipline.data.us_equity_pricing.SQLiteAdjustmentWriter
+.. autoclass:: zipline.data.adjustments.SQLiteAdjustmentWriter
    :members:
 
 .. autoclass:: zipline.assets.AssetDBWriter
@@ -299,19 +390,19 @@ Readers
 .. autoclass:: zipline.data.minute_bars.BcolzMinuteBarReader
    :members:
 
-.. autoclass:: zipline.data.us_equity_pricing.BcolzDailyBarReader
+.. autoclass:: zipline.data.bcolz_daily_bars.BcolzDailyBarReader
    :members:
 
-.. autoclass:: zipline.data.us_equity_pricing.SQLiteAdjustmentReader
+.. autoclass:: zipline.data.adjustments.SQLiteAdjustmentReader
    :members:
 
 .. autoclass:: zipline.assets.AssetFinder
    :members:
 
-.. autoclass:: zipline.assets.AssetFinderCachedEquities
+.. autoclass:: zipline.data.data_portal.DataPortal
    :members:
 
-.. autoclass:: zipline.data.data_portal.DataPortal
+.. autoclass:: zipline.sources.benchmark_source.BenchmarkSource
    :members:
 
 Bundles
@@ -327,12 +418,75 @@ Bundles
 .. data:: zipline.data.bundles.bundles
 
    The bundles that have been registered as a mapping from bundle name to bundle
-   data. This mapping is immutable and should only be updated through
+   data. This mapping is immutable and may only be updated through
    :func:`~zipline.data.bundles.register` or
    :func:`~zipline.data.bundles.unregister`.
 
-.. autofunction:: zipline.data.bundles.yahoo_equities
 
+Risk Metrics
+~~~~~~~~~~~~
+
+Algorithm State
+```````````````
+
+.. autoclass:: zipline.finance.ledger.Ledger
+   :members:
+
+.. autoclass:: zipline.protocol.Portfolio
+   :members:
+
+.. autoclass:: zipline.protocol.Account
+   :members:
+
+.. autoclass:: zipline.finance.ledger.PositionTracker
+   :members:
+
+.. autoclass:: zipline.finance._finance_ext.PositionStats
+
+Built-in Metrics
+````````````````
+
+.. autoclass:: zipline.finance.metrics.metric.SimpleLedgerField
+
+.. autoclass:: zipline.finance.metrics.metric.DailyLedgerField
+
+.. autoclass:: zipline.finance.metrics.metric.StartOfPeriodLedgerField
+
+.. autoclass:: zipline.finance.metrics.metric.StartOfPeriodLedgerField
+
+.. autoclass:: zipline.finance.metrics.metric.Returns
+
+.. autoclass:: zipline.finance.metrics.metric.BenchmarkReturnsAndVolatility
+
+.. autoclass:: zipline.finance.metrics.metric.CashFlow
+
+.. autoclass:: zipline.finance.metrics.metric.Orders
+
+.. autoclass:: zipline.finance.metrics.metric.Transactions
+
+.. autoclass:: zipline.finance.metrics.metric.Positions
+
+.. autoclass:: zipline.finance.metrics.metric.ReturnsStatistic
+
+.. autoclass:: zipline.finance.metrics.metric.AlphaBeta
+
+.. autoclass:: zipline.finance.metrics.metric.MaxLeverage
+
+Metrics Sets
+````````````
+
+.. autofunction:: zipline.finance.metrics.register
+
+.. autofunction:: zipline.finance.metrics.load
+
+.. autofunction:: zipline.finance.metrics.unregister
+
+.. data:: zipline.data.finance.metrics.metrics_sets
+
+   The metrics sets that have been registered as a mapping from metrics set name
+   to load function. This mapping is immutable and may only be updated through
+   :func:`~zipline.finance.metrics.register` or
+   :func:`~zipline.finance.metrics.unregister`.
 
 
 Utilities

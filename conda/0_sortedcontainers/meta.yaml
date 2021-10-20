@@ -1,62 +1,48 @@
+{% set name = "sortedcontainers" %}
+{% set version = "2.1.0" %}
+{% set sha256 = "974e9a32f56b17c1bac2aebd9dcf197f3eb9cd30553c5852a3187ad162e1a03a" %}
+
 package:
-  name: sortedcontainers
-  version: "1.4.4"
+  name: {{ name }}
+  version: {{ version }}
 
 source:
-  fn: sortedcontainers-1.4.4.tar.gz
-  url: https://pypi.python.org/packages/source/s/sortedcontainers/sortedcontainers-1.4.4.tar.gz
-  md5: 456638aea9f8f705bd2e3c891c402023
-#  patches:
-   # List any patch files here
-   # - fix.patch
+  fn: {{ name }}-{{ version }}.tar.gz
+  url: https://pypi.io/packages/source/{{ name[0] }}/{{ name }}/{{ name }}-{{ version }}.tar.gz
+  sha256: {{ sha256 }}
 
-# build:
-  # noarch_python: True
-  # preserve_egg_dir: True
-  # entry_points:
-    # Put any entry points (scripts to be generated automatically) here. The
-    # syntax is module:function.  For example
-    #
-    # - sortedcontainers = sortedcontainers:main
-    #
-    # Would create an entry point called sortedcontainers that calls sortedcontainers.main()
-
-
-  # If this is a new build for the same version, increment the build
-  # number. If you do not include this key, it defaults to 0.
-  # number: 1
+build:
+  number: 0
+  script: python setup.py install --single-version-externally-managed --record=record.txt
 
 requirements:
-  build:
+  host:
     - python
     - setuptools
 
   run:
     - python
 
+
 test:
-  # Python imports
   imports:
     - sortedcontainers
 
-  # commands:
-    # You can put test commands to be run here.  Use this to test that the
-    # entry points work.
-
-
-  # You can also put a file called run_test.py in the recipe that will be run
-  # at test time.
-
-  requires:
-    # - tox
-    # Put any additional test requirements here.  For example
-    # - nose
-
 about:
   home: http://www.grantjenks.com/docs/sortedcontainers/
-  license: Apache Software License
+  license: Apache 2.0
+  license_file: LICENSE
   summary: 'Python Sorted Container Types: SortedList, SortedDict, and SortedSet'
+  description: |
+    SortedContainers is a sorted collections library, written in pure-Python
+    and fast as C-extensions.
+  doc_url: http://www.grantjenks.com/docs/sortedcontainers/
+  dev_url: https://github.com/grantjenks/python-sortedcontainers
+  doc_source_url: https://github.com/grantjenks/python-sortedcontainers/blob/master/docs/index.rst
 
-# See
-# http://docs.continuum.io/conda/build.html for
-# more information about meta.yaml
+extra:
+  recipe-maintainers:
+    - grantjenks
+    - msarahan
+    - richafrank
+    - nehaljwani

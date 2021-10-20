@@ -1,6 +1,7 @@
 """
 Tests for statistical pipeline terms.
 """
+import numpy as np
 from numpy import (
     arange,
     full,
@@ -14,20 +15,28 @@ from pandas import (
     Int64Index,
     Timestamp,
 )
-from pandas.util.testing import assert_frame_equal
+from pandas.testing import assert_frame_equal
 from scipy.stats import linregress, pearsonr, spearmanr
 
-from zipline.assets import Equity
+from empyrical.stats import beta_aligned as empyrical_beta
+
+from zipline.assets import Equity, ExchangeInfo
 from zipline.errors import IncompatibleTerms, NonExistentAssetInTimeFrame
 from zipline.pipeline import CustomFactor, Pipeline
 from zipline.pipeline.data import USEquityPricing
 from zipline.pipeline.data.testing import TestingDataSet
+from zipline.pipeline.domain import US_EQUITIES
 from zipline.pipeline.engine import SimplePipelineEngine
 from zipline.pipeline.factors import (
     Returns,
     RollingLinearRegressionOfReturns,
     RollingPearsonOfReturns,
     RollingSpearmanOfReturns,
+    SimpleBeta,
+)
+from zipline.pipeline.factors.statistical import (
+    vectorized_beta,
+    vectorized_pearson_r,
 )
 from zipline.pipeline.loaders.frame import DataFrameLoader
 from zipline.pipeline.sentinels import NotSpecified
@@ -39,22 +48,24 @@ from zipline.testing import (
     make_cascading_boolean_array,
     parameter_space,
 )
-from zipline.testing.fixtures import (
-    WithSeededRandomPipelineEngine,
-    WithTradingEnvironment,
-    ZiplineTestCase,
-)
+import zipline.testing.fixtures as zf
+from zipline.testing.predicates import assert_equal
 from zipline.utils.numpy_utils import (
+    as_column,
     bool_dtype,
     datetime64ns_dtype,
     float64_dtype,
 )
 
 
-class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
+class StatisticalBuiltInsTestCase(zf.WithAssetFinder,
+                                  zf.WithTradingCalendars,
+                                  zf.ZiplineTestCase):
     sids = ASSET_FINDER_EQUITY_SIDS = Int64Index([1, 2, 3])
     START_DATE = Timestamp('2015-01-31', tz='UTC')
     END_DATE = Timestamp('2015-03-01', tz='UTC')
+    ASSET_FINDER_EQUITY_SYMBOLS = ('A', 'B', 'C')
+    ASSET_FINDER_COUNTRY_CODE = 'US'
 
     @classmethod
     def init_class_fixtures(cls):
@@ -97,8 +108,8 @@ class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
 
         cls.run_pipeline = SimplePipelineEngine(
             {USEquityPricing.close: close_loader}.__getitem__,
-            dates,
             cls.asset_finder,
+            default_domain=US_EQUITIES,
         ).run_pipeline
 
         cls.cascading_mask = \
@@ -308,13 +319,45 @@ class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
                 )
                 assert_frame_equal(output_result, expected_output_result)
 
+    def test_simple_beta_matches_regression(self):
+        run_pipeline = self.run_pipeline
+        simple_beta = SimpleBeta(target=self.my_asset, regression_length=10)
+        complex_beta = RollingLinearRegressionOfReturns(
+            target=self.my_asset,
+            returns_length=2,
+            regression_length=10,
+        ).beta
+        pipe = Pipeline({'simple': simple_beta, 'complex': complex_beta})
+        results = run_pipeline(
+            pipe,
+            self.pipeline_start_date,
+            self.pipeline_end_date,
+        )
+        assert_equal(results['simple'], results['complex'], check_names=False)
+
+    def test_simple_beta_allowed_missing_calculation(self):
+        for percentage, expected in [(0.651, 65),
+                                     (0.659, 65),
+                                     (0.66, 66),
+                                     (0.0, 0),
+                                     (1.0, 100)]:
+            beta = SimpleBeta(
+                target=self.my_asset,
+                regression_length=100,
+                allowed_missing_percentage=percentage,
+            )
+            self.assertEqual(beta.params['allowed_missing_count'], expected)
+
     def test_correlation_and_regression_with_bad_asset(self):
         """
         Test that `RollingPearsonOfReturns`, `RollingSpearmanOfReturns` and
         `RollingLinearRegressionOfReturns` raise the proper exception when
         given a nonexistent target asset.
         """
-        my_asset = Equity(0, exchange="TEST")
+        my_asset = Equity(
+            0,
+            exchange_info=ExchangeInfo('TEST', 'TEST FULL', 'US'),
+        )
         start_date = self.pipeline_start_date
         end_date = self.pipeline_end_date
         run_pipeline = self.run_pipeline
@@ -363,7 +406,10 @@ class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
                 )
 
     def test_require_length_greater_than_one(self):
-        my_asset = Equity(0, exchange="TEST")
+        my_asset = Equity(
+            0,
+            exchange_info=ExchangeInfo('TEST', 'TEST FULL', 'US'),
+        )
 
         with self.assertRaises(ValueError):
             RollingPearsonOfReturns(
@@ -386,12 +432,85 @@ class StatisticalBuiltInsTestCase(WithTradingEnvironment, ZiplineTestCase):
                 regression_length=1,
             )
 
+    def test_simple_beta_input_validation(self):
+        with self.assertRaises(TypeError) as e:
+            SimpleBeta(
+                target="SPY",
+                regression_length=100,
+                allowed_missing_percentage=0.5,
+            )
+        result = str(e.exception)
+        expected = (
+            r"SimpleBeta\(\) expected a value of type"
+            " .*Asset for argument 'target',"
+            " but got str instead."
+        )
+        self.assertRegexpMatches(result, expected)
 
-class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
-                                 ZiplineTestCase):
+        with self.assertRaises(ValueError) as e:
+            SimpleBeta(
+                target=self.my_asset,
+                regression_length=1,
+                allowed_missing_percentage=0.5,
+            )
+        result = str(e.exception)
+        expected = (
+            "SimpleBeta() expected a value greater than or equal to 3"
+            " for argument 'regression_length', but got 1 instead."
+        )
+        self.assertEqual(result, expected)
+
+        with self.assertRaises(ValueError) as e:
+            SimpleBeta(
+                target=self.my_asset,
+                regression_length=100,
+                allowed_missing_percentage=50,
+            )
+        result = str(e.exception)
+        expected = (
+            "SimpleBeta() expected a value inclusively between 0.0 and 1.0 "
+            "for argument 'allowed_missing_percentage', but got 50 instead."
+        )
+        self.assertEqual(result, expected)
+
+    def test_simple_beta_target(self):
+        beta = SimpleBeta(
+            target=self.my_asset,
+            regression_length=50,
+            allowed_missing_percentage=0.5,
+        )
+        self.assertIs(beta.target, self.my_asset)
+
+    def test_simple_beta_repr(self):
+        beta = SimpleBeta(
+            target=self.my_asset,
+            regression_length=50,
+            allowed_missing_percentage=0.5,
+        )
+        result = repr(beta)
+        expected = "SimpleBeta({}, length=50, allowed_missing=25)".format(
+            self.my_asset,
+        )
+        self.assertEqual(result, expected)
+
+    def test_simple_beta_graph_repr(self):
+        beta = SimpleBeta(
+            target=self.my_asset,
+            regression_length=50,
+            allowed_missing_percentage=0.5,
+        )
+        result = beta.graph_repr()
+        expected = "SimpleBeta('A', 50, 25)".format(self.my_asset)
+        self.assertEqual(result, expected)
+
+
+class StatisticalMethodsTestCase(zf.WithSeededRandomPipelineEngine,
+                                 zf.ZiplineTestCase):
     sids = ASSET_FINDER_EQUITY_SIDS = Int64Index([1, 2, 3])
     START_DATE = Timestamp('2015-01-31', tz='UTC')
     END_DATE = Timestamp('2015-03-01', tz='UTC')
+    ASSET_FINDER_COUNTRY_CODE = 'US'
+    SEEDED_RANDOM_PIPELINE_DEFAULT_DOMAIN = US_EQUITIES
 
     @classmethod
     def init_class_fixtures(cls):
@@ -802,3 +921,225 @@ class StatisticalMethodsTestCase(WithSeededRandomPipelineEngine,
                 columns=assets,
             )
             assert_frame_equal(output_result, expected_output_result)
+
+
+class VectorizedBetaTestCase(zf.ZiplineTestCase):
+
+    def compare_with_empyrical(self, dependents, independent):
+        INFINITY = 1000000  # close enough
+        result = vectorized_beta(
+            dependents, independent, allowed_missing=INFINITY,
+        )
+        expected = np.array([
+            empyrical_beta(dependents[:, i].ravel(), independent.ravel())
+            for i in range(dependents.shape[1])
+        ])
+        assert_equal(result, expected, array_decimal=7)
+        return result
+
+    @parameter_space(seed=[1, 2, 3], __fail_fast=True)
+    def test_matches_empyrical_beta_aligned(self, seed):
+        rand = np.random.RandomState(seed)
+
+        true_betas = np.array([-0.5, 0.0, 0.5, 1.0, 1.5])
+        independent = as_column(np.linspace(-5., 5., 30))
+        noise = as_column(rand.uniform(-.1, .1, 30))
+        dependents = 1.0 + true_betas * independent + noise
+
+        result = self.compare_with_empyrical(dependents, independent)
+        self.assertTrue((np.abs(result - true_betas) < 0.01).all())
+
+    @parameter_space(
+        seed=[1, 2],
+        pct_dependent=[0.3],
+        pct_independent=[0.75],
+        __fail_fast=True,
+    )
+    def test_nan_handling_matches_empyrical(self,
+                                            seed,
+                                            pct_dependent,
+                                            pct_independent):
+        rand = np.random.RandomState(seed)
+
+        true_betas = np.array([-0.5, 0.0, 0.5, 1.0, 1.5]) * 10
+        independent = as_column(np.linspace(-5., 10., 50))
+        noise = as_column(rand.uniform(-.1, .1, 50))
+        dependents = 1.0 + true_betas * independent + noise
+
+        # Fill 20% of the input arrays with nans randomly.
+        dependents[rand.uniform(0, 1, dependents.shape) < pct_dependent] = nan
+        independent[independent > np.nanmean(independent)] = nan
+
+        # Sanity check that we actually inserted some nans.
+        # self.assertTrue(np.count_nonzero(np.isnan(dependents)) > 0)
+        self.assertTrue(np.count_nonzero(np.isnan(independent)) > 0)
+
+        result = self.compare_with_empyrical(dependents, independent)
+
+        # compare_with_empyrical uses requred_observations=0, so we shouldn't
+        # have any nans in the output even though we had some in the input.
+        self.assertTrue(not np.isnan(result).any())
+
+    @parameter_space(nan_offset=[-1, 0, 1])
+    def test_produce_nans_when_too_much_missing_data(self, nan_offset):
+        rand = np.random.RandomState(42)
+
+        true_betas = np.array([-0.5, 0.0, 0.5, 1.0, 1.5])
+        independent = as_column(np.linspace(-5., 5., 30))
+        noise = as_column(rand.uniform(-.1, .1, 30))
+        dependents = 1.0 + true_betas * independent + noise
+
+        # Write nans in a triangular pattern into the middle of the dependent
+        # array.
+        nan_grid = np.array([[1, 0, 0, 0, 0],
+                             [1, 1, 0, 0, 0],
+                             [1, 1, 1, 0, 0],
+                             [1, 1, 1, 1, 0],
+                             [1, 1, 1, 1, 1]], dtype=bool)
+        num_nans = nan_grid.sum(axis=0)
+        # Move the grid around in the parameterized tests. The positions
+        # shouldn't matter.
+        dependents[10 + nan_offset:15 + nan_offset][nan_grid] = np.nan
+
+        for allowed_missing in range(7):
+            results = vectorized_beta(dependents, independent, allowed_missing)
+            for i, expected in enumerate(true_betas):
+                result = results[i]
+                expect_nan = num_nans[i] > allowed_missing
+                true_beta = true_betas[i]
+                if expect_nan:
+                    self.assertTrue(np.isnan(result))
+                else:
+                    self.assertTrue(np.abs(result - true_beta) < 0.01)
+
+    def test_allowed_missing_doesnt_double_count(self):
+        # Test that allowed_missing only counts a row as missing one
+        # observation if it's missing in both the dependent and independent
+        # variable.
+        rand = np.random.RandomState(42)
+        true_betas = np.array([-0.5, 0.0, 0.5, 1.0, 1.5])
+        independent = as_column(np.linspace(-5., 5., 30))
+        noise = as_column(rand.uniform(-.1, .1, 30))
+        dependents = 1.0 + true_betas * independent + noise
+
+        # Each column has three nans in the grid.
+        dependent_nan_grid = np.array([[0, 1, 1, 1, 0],
+                                       [0, 0, 1, 1, 1],
+                                       [1, 0, 0, 1, 1],
+                                       [1, 1, 0, 0, 1],
+                                       [1, 1, 1, 0, 0]], dtype=bool)
+        # There are also two nans in the independent data.
+        independent_nan_grid = np.array([[0],
+                                         [0],
+                                         [1],
+                                         [1],
+                                         [0]], dtype=bool)
+
+        dependents[10:15][dependent_nan_grid] = np.nan
+        independent[10:15][independent_nan_grid] = np.nan
+
+        # With only two allowed missing values, everything should come up nan,
+        # because column has at least 3 nans in the dependent data.
+        result2 = vectorized_beta(dependents, independent, allowed_missing=2)
+        assert_equal(np.isnan(result2),
+                     np.array([True, True, True, True, True]))
+
+        # With three allowed missing values, the first and last columns should
+        # produce a value, because they have nans at the same rows where the
+        # independent data has nans.
+        result3 = vectorized_beta(dependents, independent, allowed_missing=3)
+        assert_equal(np.isnan(result3),
+                     np.array([False, True, True, True, False]))
+
+        # With four allowed missing values, everything but the middle column
+        # should produce a value. The middle column will have 5 nans because
+        # the dependent nans have no overlap with the independent nans.
+        result4 = vectorized_beta(dependents, independent, allowed_missing=4)
+        assert_equal(np.isnan(result4),
+                     np.array([False, False, True, False, False]))
+
+        # With five allowed missing values, everything should produce a value.
+        result5 = vectorized_beta(dependents, independent, allowed_missing=5)
+        assert_equal(np.isnan(result5),
+                     np.array([False, False, False, False, False]))
+
+
+class VectorizedCorrelationTestCase(zf.ZiplineTestCase):
+
+    def naive_columnwise_func(self, func, left, right):
+        out = np.empty_like(left[0])
+        self.assertEqual(left.shape, right.shape)
+
+        for col in range(left.shape[1]):
+            left_col = left[:, col]
+            right_col = right[:, col]
+            missing = np.isnan(left_col) | np.isnan(right_col)
+            left_col = left_col[~missing]
+            right_col = right_col[~missing]
+            r, pvalue = func(left_col, right_col)
+            out[col] = r
+
+        return out
+
+    def naive_columnwise_pearson(self, left, right):
+        return self.naive_columnwise_func(pearsonr, left, right)
+
+    def naive_columnwise_spearman(self, left, right):
+        return self.naive_columnwise_func(spearmanr, left, right)
+
+    @parameter_space(
+        seed=[1, 2, 42],
+        nan_offset=[-1, 0, 1],
+        nans=['dependent', 'independent', 'both'],
+        __fail_fast=True,
+    )
+    def test_produce_nans_when_too_much_missing_data(self,
+                                                     seed,
+                                                     nans,
+                                                     nan_offset):
+        rand = np.random.RandomState(seed)
+
+        betas = np.array([-0.5, 0.0, 0.5, 1.0, 1.5])
+        independents = as_column(np.linspace(-5., 5., 30)) + np.arange(5)
+        noise = as_column(rand.uniform(-2, 2, 30))
+        dependents = 1.0 + betas * independents + noise
+
+        # Write nans in a triangular pattern into the middle of the dependent
+        # array.
+        nan_grid = np.array([[1, 1, 1, 1, 1],
+                             [0, 1, 1, 1, 1],
+                             [0, 0, 1, 1, 1],
+                             [0, 0, 0, 1, 1],
+                             [0, 0, 0, 0, 1]], dtype=bool)
+
+        if nans == 'dependent' or nans == 'both':
+            dependents[10 + nan_offset:15 + nan_offset][nan_grid] = np.nan
+        if nans == 'independent' or nans == 'both':
+            independents[10 + nan_offset:15 + nan_offset][nan_grid] = np.nan
+
+        expected = self.naive_columnwise_pearson(dependents, independents)
+        for allowed_missing in list(range(7)) + [10000]:
+            results = vectorized_pearson_r(
+                dependents, independents, allowed_missing
+            )
+            for i, result in enumerate(results):
+                # column i has i + 1 missing values.
+                if i + 1 > allowed_missing:
+                    self.assertTrue(np.isnan(result))
+                else:
+                    assert_equal(result, expected[i])
+
+    def test_broadcasting(self):
+        _independent = as_column(np.array([1, 2, 3, 4, 5]))
+        dependent = _independent * [2.5, 1.0, -3.5]
+
+        def do_check(independent):
+            result = vectorized_pearson_r(
+                dependent, independent, allowed_missing=0
+            )
+            assert_equal(result, np.array([1.0, 1.0, -1.0]))
+
+        # We should get the same result from passing a N x 1 array or an N x 3
+        # array with the column tiled 3 times.
+        do_check(_independent)
+        do_check(np.tile(_independent, 3))

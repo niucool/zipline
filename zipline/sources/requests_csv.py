@@ -58,7 +58,7 @@ class FetcherCSVRedirectError(ZiplineError):
 
 # The following optional arguments are supported for
 # requests backed data sources.
-# see http://docs.python-requests.org/en/latest/api/#main-interface
+# see https://requests.readthedocs.io/en/latest/api/#main-interface
 # for a full list.
 ALLOWED_REQUESTS_KWARGS = {
     'params',
@@ -70,7 +70,7 @@ ALLOWED_REQUESTS_KWARGS = {
 
 # The following optional arguments are supported for pandas' read_csv
 # function, and may be passed as kwargs to the datasource below.
-# see http://pandas.pydata.org/
+# see https://pandas.pydata.org/
 # pandas-docs/stable/generated/pandas.io.parsers.read_csv.html
 ALLOWED_READ_CSV_KWARGS = {
     'sep',
@@ -157,6 +157,7 @@ class PandasCSV(with_metaclass(ABCMeta, object)):
                  mask,
                  symbol_column,
                  data_frequency,
+                 country_code,
                  **kwargs):
 
         self.start_date = start_date
@@ -167,6 +168,7 @@ class PandasCSV(with_metaclass(ABCMeta, object)):
         self.mask = mask
         self.symbol_column = symbol_column or "symbol"
         self.data_frequency = data_frequency
+        self.country_code = country_code
 
         invalid_kwargs = set(kwargs) - ALLOWED_READ_CSV_KWARGS
         if invalid_kwargs:
@@ -272,7 +274,11 @@ class PandasCSV(with_metaclass(ABCMeta, object)):
             return numpy.nan
 
         try:
-            return self.finder.lookup_symbol(uppered, as_of_date=None)
+            return self.finder.lookup_symbol(
+                uppered,
+                as_of_date=None,
+                country_code=self.country_code,
+            )
         except MultipleSymbolsFound:
             # Fill conflicted entries with zeros to mark that they need to be
             # resolved by date.
@@ -342,6 +348,7 @@ class PandasCSV(with_metaclass(ABCMeta, object)):
                         # Replacing tzinfo here is necessary because of the
                         # timezone metadata bug described below.
                         row['dt'].replace(tzinfo=pytz.utc),
+                        country_code=self.country_code,
 
                         # It's possible that no asset comes back here if our
                         # lookup date is from before any asset held the
@@ -352,7 +359,7 @@ class PandasCSV(with_metaclass(ABCMeta, object)):
                     asset = numpy.nan
 
                 # Assign the resolved asset to the cell
-                df.ix[row_idx, 'sid'] = asset
+                df.loc[row_idx, 'sid'] = asset
 
             # Filter out rows containing symbols that we failed to find.
             length_before_drop = len(df)
@@ -470,6 +477,7 @@ class PandasRequestsCSV(PandasCSV):
                  mask,
                  symbol_column,
                  data_frequency,
+                 country_code,
                  special_params_checker=None,
                  **kwargs):
 
@@ -503,6 +511,7 @@ class PandasRequestsCSV(PandasCSV):
             mask,
             symbol_column,
             data_frequency,
+            country_code=country_code,
             **remaining_kwargs
         )
 

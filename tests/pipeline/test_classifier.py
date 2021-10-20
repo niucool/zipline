@@ -1,11 +1,13 @@
 from functools import reduce
-from operator import or_
-
+import operator as op
+import unittest
 import numpy as np
 import pandas as pd
 
 from zipline.lib.labelarray import LabelArray
 from zipline.pipeline import Classifier
+from zipline.pipeline.data.testing import TestingDataSet
+from zipline.pipeline.expression import methods_to_ops
 from zipline.testing import parameter_space
 from zipline.testing.fixtures import ZiplineTestCase
 from zipline.testing.predicates import assert_equal
@@ -14,14 +16,14 @@ from zipline.utils.numpy_utils import (
     int64_dtype,
 )
 
-from .base import BasePipelineTestCase
+from .base import BaseUSEquityPipelineTestCase
 
 
 bytes_dtype = np.dtype('S3')
 unicode_dtype = np.dtype('U3')
 
 
-class ClassifierTestCase(BasePipelineTestCase):
+class ClassifierTestCase(BaseUSEquityPipelineTestCase):
 
     @parameter_space(mv=[-1, 0, 1, 999])
     def test_integral_isnull(self, mv):
@@ -404,7 +406,7 @@ class ClassifierTestCase(BasePipelineTestCase):
         for choices in [(0,), (0, 1), (0, 1, 2)]:
             terms[str(choices)] = c.element_of(choices)
             expected[str(choices)] = reduce(
-                or_,
+                op.or_,
                 (data == elem for elem in choices),
                 np.zeros_like(data, dtype=bool),
             )
@@ -445,6 +447,7 @@ class ClassifierTestCase(BasePipelineTestCase):
             )
             self.assertEqual(errmsg, expected)
 
+    @unittest.skip
     @parameter_space(dtype_=Classifier.ALLOWED_DTYPES)
     def test_element_of_rejects_unhashable_type(self, dtype_):
 
@@ -467,6 +470,211 @@ class ClassifierTestCase(BasePipelineTestCase):
             "TypeError(\"unhashable type: 'dict'\",)."
         )
         self.assertEqual(errmsg, expected)
+
+    @parameter_space(
+        __fail_fast=True,
+        labelarray_dtype=(categorical_dtype, bytes_dtype, unicode_dtype),
+        relabel_func=[
+            lambda s: str(s[0]),
+            lambda s: str(len(s)),
+            lambda s: str(len([c for c in s if c == 'a'])),
+            lambda s: None,
+        ]
+    )
+    def test_relabel_strings(self, relabel_func, labelarray_dtype):
+
+        class C(Classifier):
+            inputs = ()
+            dtype = categorical_dtype
+            missing_value = None
+            window_length = 0
+
+        c = C()
+
+        raw = np.asarray(
+            [['a', 'aa', 'aaa', 'abab'],
+             ['bab', 'aba', 'aa', 'bb'],
+             ['a', 'aba', 'abaa', 'abaab'],
+             ['a', 'aa', 'aaa', 'aaaa']],
+            dtype=labelarray_dtype,
+        )
+        raw_relabeled = np.vectorize(relabel_func, otypes=[object])(raw)
+
+        data = LabelArray(raw, missing_value=None)
+
+        terms = {
+            'relabeled': c.relabel(relabel_func),
+        }
+        expected_results = {
+            'relabeled': LabelArray(raw_relabeled, missing_value=None),
+        }
+
+        self.check_terms(
+            terms,
+            expected_results,
+            initial_workspace={c: data},
+            mask=self.build_mask(self.ones_mask(shape=data.shape)),
+        )
+
+    @parameter_space(
+        __fail_fast=True,
+        missing_value=[None, 'M'],
+    )
+    def test_relabel_missing_value_interactions(self, missing_value):
+
+        mv = missing_value
+
+        class C(Classifier):
+            inputs = ()
+            dtype = categorical_dtype
+            missing_value = mv
+            window_length = 0
+
+        c = C()
+
+        def relabel_func(s):
+            if s == 'B':
+                return mv
+            return ''.join([s, s])
+
+        raw = np.asarray(
+            [['A', 'B', 'C', mv],
+             [mv, 'A', 'B', 'C'],
+             ['C', mv, 'A', 'B'],
+             ['B', 'C', mv, 'A']],
+            dtype=categorical_dtype,
+        )
+        data = LabelArray(raw, missing_value=mv)
+
+        expected_relabeled_raw = np.asarray(
+            [['AA', mv, 'CC', mv],
+             [mv, 'AA', mv, 'CC'],
+             ['CC', mv, 'AA', mv],
+             [mv, 'CC', mv, 'AA']],
+            dtype=categorical_dtype,
+        )
+
+        terms = {
+            'relabeled': c.relabel(relabel_func),
+        }
+        expected_results = {
+            'relabeled': LabelArray(expected_relabeled_raw, missing_value=mv),
+        }
+
+        self.check_terms(
+            terms,
+            expected_results,
+            initial_workspace={c: data},
+            mask=self.build_mask(self.ones_mask(shape=data.shape)),
+        )
+
+    def test_relabel_int_classifier_not_yet_supported(self):
+        class C(Classifier):
+            inputs = ()
+            dtype = int64_dtype
+            missing_value = -1
+            window_length = 0
+
+        c = C()
+
+        with self.assertRaises(TypeError) as e:
+            c.relabel(lambda x: 0 / 0)  # Function should never be called.
+
+        result = str(e.exception)
+        expected = (
+            "relabel() is only defined on Classifiers producing strings "
+            "but it was called on a Classifier of dtype int64."
+        )
+        self.assertEqual(result, expected)
+
+    @parameter_space(
+        compare_op=[op.gt, op.ge, op.le, op.lt],
+        dtype_and_missing=[(int64_dtype, 0), (categorical_dtype, '')],
+    )
+    def test_bad_compare(self, compare_op, dtype_and_missing):
+        class C(Classifier):
+            inputs = ()
+            window_length = 0
+            dtype = dtype_and_missing[0]
+            missing_value = dtype_and_missing[1]
+
+        with self.assertRaises(TypeError) as e:
+            compare_op(C(), object())
+
+        self.assertEqual(
+            str(e.exception),
+            'cannot compare classifiers with %s' % (
+                methods_to_ops['__%s__' % compare_op.__name__],
+            ),
+        )
+
+    @parameter_space(
+        dtype_and_missing=[(int64_dtype, -1), (categorical_dtype, None)],
+        use_mask=[True, False],
+    )
+    def test_peer_count(self, dtype_and_missing, use_mask):
+        class C(Classifier):
+            dtype = dtype_and_missing[0]
+            missing_value = dtype_and_missing[1]
+            inputs = ()
+            window_length = 0
+
+        c = C()
+
+        if dtype_and_missing[0] == int64_dtype:
+            data = np.array(
+                [[1, 1, -1, 2, 1, -1],
+                 [2, 1, 3, 2, 2, 2],
+                 [-1, 1, 10, 10, 10, -1],
+                 [3, 3, 3, 3, 3, 3]],
+                dtype=int64_dtype,
+            )
+        else:
+            data = LabelArray(
+                [['a', 'a', None, 'b', 'a', None],
+                 ['b', 'a', 'c', 'b', 'b', 'b'],
+                 [None, 'a', 'aa', 'aa', 'aa', None],
+                 ['c', 'c', 'c', 'c', 'c', 'c']],
+                missing_value=None,
+            )
+
+        if not use_mask:
+            mask = self.build_mask(self.ones_mask(shape=data.shape))
+            expected = np.array(
+                [[3, 3, np.nan, 1, 3, np.nan],
+                 [4, 1, 1, 4, 4, 4],
+                 [np.nan, 1, 3, 3, 3, np.nan],
+                 [6, 6, 6, 6, 6, 6]],
+            )
+        else:
+            # Punch a couple holes in the mask to check that we handle the mask
+            # correctly.
+            mask = self.build_mask(
+                np.array([[1, 1, 1, 1, 0, 1],
+                          [1, 1, 1, 1, 1, 0],
+                          [1, 1, 1, 1, 1, 1],
+                          [1, 1, 0, 0, 1, 1]], dtype='bool')
+            )
+            expected = np.array(
+                [[2, 2, np.nan, 1, np.nan, np.nan],
+                 [3, 1, 1, 3, 3, np.nan],
+                 [np.nan, 1, 3, 3, 3, np.nan],
+                 [4, 4, np.nan, np.nan, 4, 4]],
+            )
+
+        terms = {
+            'peer_counts': c.peer_count(),
+        }
+        expected_results = {
+            'peer_counts': expected,
+        }
+
+        self.check_terms(
+            terms=terms,
+            expected=expected_results,
+            initial_workspace={c: data},
+            mask=mask,
+        )
 
 
 class TestPostProcessAndToWorkSpaceValue(ZiplineTestCase):
@@ -545,3 +753,10 @@ class TestPostProcessAndToWorkSpaceValue(ZiplineTestCase):
             f.to_workspace_value(pipeline_output, pd.Index([0, 1])),
             column_data,
         )
+
+
+class ReprTestCase(ZiplineTestCase):
+
+    def test_quantiles_graph_repr(self):
+        quantiles = TestingDataSet.float_col.latest.quantiles(5)
+        self.assertEqual(quantiles.graph_repr(), "Quantiles(5)")

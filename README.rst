@@ -1,51 +1,35 @@
-.. image:: http://www.zipline-live.io/images/zipline_live.png
-    :target: http://www.zipline-live.io
+.. image:: https://readthedocs.org/projects/zipline-trader/badge/?version=latest
+   :target: https://zipline-trader.readthedocs.io/en/latest/?badge=latest
+   :alt: Documentation Status
+.. image:: https://github.com/shlomikushchi/zipline-trader/workflows/Zipline%20CI%20(Ubuntu)/badge.svg
+   :target: https://github.com/shlomikushchi/zipline-trader/workflows/Zipline%20CI%20(Ubuntu)/badge.svg
+   :alt: Github Actions
+.. image:: https://github.com/shlomikushchi/zipline-trader/workflows/Zipline%20CI%20(Windows)/badge.svg
+   :target: https://github.com/shlomikushchi/zipline-trader/workflows/Zipline%20CI%20(Windows)/badge.svg
+   :alt: Github Actions
+.. image:: https://github.com/shlomikushchi/zipline-trader/workflows/Zipline%20CI%20(macOS)/badge.svg
+   :target: https://github.com/shlomikushchi/zipline-trader/workflows/Zipline%20CI%20(macOS)/badge.svg
+   :alt: Github Actions
+
+|
+
+.. image:: ./images/zipline-live2.small.png
+    :target: https://github.com/shlomikushchi/zipline-trader
     :width: 212px
     :align: center
     :alt: zipline-live
 
-zipline-live
-============
+zipline-trader
+==============
 
-|pypi badge|
-|travis status|
-|appveyor status|
-|Coverage Status|
-|Apache License|
-
-Welcome to zipline-live, the on-premise trading platform built on top of Quantopian’s
+Welcome to zipline-trader, the on-premise trading platform built on top of Quantopian's
 `zipline <https://github.com/quantopian/zipline>`_.
 
-zipline-live is designed to be an extensible, drop-in replacement for zipline with
-multiple brokerage support to enable on premise trading of zipline algorithms.
-
-See the `tutorial <http://www.zipline-live.io/tutorial>`_ and `features <http://www.zipline-live.io/features>`_ for further details.
-
+This project is meant to be used for backtesting/paper/live trading with one the following brokers:
+ * Interactive Brokers
+ * Alpaca
 
 
-.. |pypi badge| image:: https://badge.fury.io/py/zipline-live.svg
-    :target: https://pypi.python.org/pypi/zipline-live
-.. |travis status| image:: https://travis-ci.org/zipline-live/zipline.svg?branch=master
-    :target: https://travis-ci.org/zipline-live/zipline
-.. |appveyor status| image:: https://ci.appveyor.com/api/projects/status/jkuo1hca8v8aueym?svg=true
-   :target: https://ci.appveyor.com/project/pbharrin/zipline/branch/master
-.. |Coverage Status| image:: https://coveralls.io/repos/github/zipline-live/zipline/badge.svg?branch=master
-   :target: https://coveralls.io/github/zipline-live/zipline?branch=master
-.. |Apache License| image:: https://img.shields.io/badge/License-Apache%202.0-blue.svg
-   :target: https://www.apache.org/licenses/LICENSE-2.0
+Please `Read The Docs <https://zipline-trader.readthedocs.io/en/latest/index.html#>`_
 
-
-.. _`Zipline Install Documentation` : http://www.zipline.io/install.html
-
-Several enhancement to zipline-live:
-=============
-
-1. Add csvdir.py to data bundle which could ingest csv files.
-
-2. Decouple data feed from broker, two data feeds are supported now:
-    A. IB data subscription
-    B. `Alpha Vantage <https://www.alphavantage.co/documentation/>`_ real time API
-
-3. Some minor improvements for easy to use.
-
-
+And you could find us on `slack <https://join.slack.com/t/zipline-live/shared_invite/zt-mrsrfhky-usB0SEU4st1SuMUCErUevA>`_

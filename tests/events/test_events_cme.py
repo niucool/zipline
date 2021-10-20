@@ -15,13 +15,13 @@
 from unittest import TestCase
 import pandas as pd
 
-from test_events import StatefulRulesTests, StatelessRulesTests, \
+from .test_events import StatefulRulesTests, StatelessRulesTests, \
     minutes_for_days
 from zipline.utils.events import AfterOpen
 
 
-class TestStatelessRulesCME(StatelessRulesTests, TestCase):
-    CALENDAR_STRING = "CME"
+class TestStatelessRulesCMES(StatelessRulesTests, TestCase):
+    CALENDAR_STRING = "CMES"
 
     HALF_SESSION = pd.Timestamp("2014-07-04", tz='UTC')
     FULL_SESSION = pd.Timestamp("2014-09-24", tz='UTC')
@@ -39,5 +39,5 @@ class TestStatelessRulesCME(StatelessRulesTests, TestCase):
                     self.assertTrue(after_open.should_trigger(minute))
 
 
-class TestStatefulRulesCME(StatefulRulesTests, TestCase):
-    CALENDAR_STRING = "CME"
+class TestStatefulRulesCMES(StatefulRulesTests, TestCase):
+    CALENDAR_STRING = "CMES"

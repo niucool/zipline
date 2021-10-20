@@ -5,8 +5,10 @@ from __future__ import division
 from collections import OrderedDict
 from itertools import product
 from operator import add, sub
+from unittest import skipIf
 
-from nose_parameterized import parameterized
+from parameterized import parameterized
+import numpy as np
 from numpy import (
     arange,
     array,
@@ -30,9 +32,10 @@ from pandas import (
     MultiIndex,
     Series,
     Timestamp,
+    Grouper
 )
 from pandas.compat.chainmap import ChainMap
-from pandas.util.testing import assert_frame_equal
+from pandas.testing import assert_frame_equal
 from six import iteritems, itervalues
 from toolz import merge
 
@@ -41,8 +44,16 @@ from zipline.errors import NoFurtherDataError
 from zipline.lib.adjustment import MULTIPLY
 from zipline.lib.labelarray import LabelArray
 from zipline.pipeline import CustomFactor, Pipeline
-from zipline.pipeline.data import Column, DataSet, USEquityPricing
+from zipline.pipeline.data import (
+    Column, DataSet, EquityPricing, USEquityPricing,
+)
 from zipline.pipeline.data.testing import TestingDataSet
+from zipline.pipeline.domain import (
+    EquitySessionDomain,
+    GENERIC,
+    JP_EQUITIES,
+    US_EQUITIES,
+)
 from zipline.pipeline.engine import SimplePipelineEngine
 from zipline.pipeline.factors import (
     AverageDollarVolume,
@@ -53,8 +64,9 @@ from zipline.pipeline.factors import (
     MaxDrawdown,
     SimpleMovingAverage,
 )
+from zipline.pipeline.filters import CustomFilter
 from zipline.pipeline.loaders.equity_pricing_loader import (
-    USEquityPricingLoader,
+    EquityPricingLoader,
 )
 from zipline.pipeline.loaders.frame import DataFrameLoader
 from zipline.pipeline.loaders.synthetic import (
@@ -67,7 +79,6 @@ from zipline.pipeline.term import InputDates
 from zipline.testing import (
     AssetID,
     AssetIDPlusDay,
-    ExplodingObject,
     check_arrays,
     make_alternating_boolean_array,
     make_cascading_boolean_array,
@@ -75,20 +86,18 @@ from zipline.testing import (
     parameter_space,
     product_upper_triangle,
 )
-from zipline.testing.fixtures import (
-    WithAdjustmentReader,
-    WithSeededRandomPipelineEngine,
-    WithTradingEnvironment,
-    ZiplineTestCase,
-)
+import zipline.testing.fixtures as zf
+from zipline.utils.exploding_object import NamedExplodingObject
+from zipline.testing.core import create_simple_domain
 from zipline.testing.predicates import assert_equal
 from zipline.utils.memoize import lazyval
 from zipline.utils.numpy_utils import bool_dtype, datetime64ns_dtype
+from zipline.utils.pandas_utils import new_pandas, skip_pipeline_new_pandas
 
 
 class RollingSumDifference(CustomFactor):
     window_length = 3
-    inputs = [USEquityPricing.open, USEquityPricing.close]
+    inputs = [EquityPricing.open, EquityPricing.close]
 
     def compute(self, today, assets, out, open, close):
         out[:] = (open - close).sum(axis=0)
@@ -96,7 +105,7 @@ class RollingSumDifference(CustomFactor):
 
 class MultipleOutputs(CustomFactor):
     window_length = 1
-    inputs = [USEquityPricing.open, USEquityPricing.close]
+    inputs = [EquityPricing.open, EquityPricing.close]
     outputs = ['open', 'close']
 
     def compute(self, today, assets, out, open, close):
@@ -109,7 +118,7 @@ class OpenCloseSumAndDiff(CustomFactor):
     Used for testing a CustomFactor with multiple outputs operating over a non-
     trivial window length.
     """
-    inputs = [USEquityPricing.open, USEquityPricing.close]
+    inputs = [EquityPricing.open, EquityPricing.close]
 
     def compute(self, today, assets, out, open, close):
         out.sum_[:] = open.sum(axis=0) + close.sum(axis=0)
@@ -153,11 +162,11 @@ class RecordingPrecomputedLoader(PrecomputedLoader):
 
         self.load_calls = []
 
-    def load_adjusted_array(self, columns, dates, assets, mask):
+    def load_adjusted_array(self, domain, columns, dates, sids, mask):
         self.load_calls.append(ColumnArgs(*columns))
 
         return super(RecordingPrecomputedLoader, self).load_adjusted_array(
-            columns, dates, assets, mask,
+            domain, columns, dates, sids, mask,
         )
 
 
@@ -167,22 +176,29 @@ class RollingSumSum(CustomFactor):
         out[:] = sum(inputs).sum(axis=0)
 
 
-class WithConstantInputs(WithTradingEnvironment):
+class WithConstantInputs(zf.WithAssetFinder):
     asset_ids = ASSET_FINDER_EQUITY_SIDS = 1, 2, 3, 4
     START_DATE = Timestamp('2014-01-01', tz='utc')
     END_DATE = Timestamp('2014-03-01', tz='utc')
+    ASSET_FINDER_COUNTRY_CODE = 'US'
 
     @classmethod
     def init_class_fixtures(cls):
         super(WithConstantInputs, cls).init_class_fixtures()
+        cls.domain = create_simple_domain(
+            start=cls.START_DATE,
+            end=cls.END_DATE,
+            country_code=cls.ASSET_FINDER_COUNTRY_CODE,
+        )
         cls.constants = {
             # Every day, assume every stock starts at 2, goes down to 1,
             # goes up to 4, and finishes at 3.
-            USEquityPricing.low: 1,
-            USEquityPricing.open: 2,
-            USEquityPricing.close: 3,
-            USEquityPricing.high: 4,
+            EquityPricing.low: 1,
+            EquityPricing.open: 2,
+            EquityPricing.close: 3,
+            EquityPricing.high: 4,
         }
+
         cls.dates = date_range(
             cls.START_DATE,
             cls.END_DATE,
@@ -195,29 +211,28 @@ class WithConstantInputs(WithTradingEnvironment):
             sids=cls.asset_ids,
         )
         cls.assets = cls.asset_finder.retrieve_all(cls.asset_ids)
-
-
-class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
-    def test_bad_dates(self):
-        loader = self.loader
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
+        cls.engine = SimplePipelineEngine(
+            lambda c: cls.loader,
+            cls.asset_finder,
+            default_domain=cls.domain
         )
 
+
+class ConstantInputTestCase(WithConstantInputs,
+                            zf.WithAssetFinder,
+                            zf.WithTradingCalendars,
+                            zf.ZiplineTestCase):
+
+    def test_bad_dates(self):
         p = Pipeline()
 
         msg = "start_date must be before or equal to end_date .*"
-        with self.assertRaisesRegexp(ValueError, msg):
-            engine.run_pipeline(p, self.dates[2], self.dates[1])
+        with self.assertRaisesRegex(ValueError, msg):
+            self.engine.run_pipeline(p, self.dates[2], self.dates[1])
 
     def test_fail_usefully_on_insufficient_data(self):
-        loader = self.loader
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
-
         class SomeFactor(CustomFactor):
-            inputs = [USEquityPricing.close]
+            inputs = [EquityPricing.close]
             window_length = 10
 
             def compute(self, today, assets, out, closes):
@@ -226,21 +241,17 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         p = Pipeline(columns={'t': SomeFactor()})
 
         # self.dates[9] is the earliest date we should be able to compute.
-        engine.run_pipeline(p, self.dates[9], self.dates[9])
+        self.engine.run_pipeline(p, self.dates[9], self.dates[9])
 
         # We shouldn't be able to compute dates[8], since we only know about 8
         # prior dates, and we need a window length of 10.
         with self.assertRaises(NoFurtherDataError):
-            engine.run_pipeline(p, self.dates[8], self.dates[8])
+            self.engine.run_pipeline(p, self.dates[8], self.dates[8])
 
     def test_input_dates_provided_by_default(self):
-        loader = self.loader
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
 
         class TestFactor(CustomFactor):
-            inputs = [InputDates(), USEquityPricing.close]
+            inputs = [InputDates(), EquityPricing.close]
             window_length = 10
             dtype = datetime64ns_dtype
 
@@ -251,17 +262,13 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
                 out[:] = first
 
         p = Pipeline(columns={'t': TestFactor()})
-        results = engine.run_pipeline(p, self.dates[9], self.dates[10])
+        results = self.engine.run_pipeline(p, self.dates[9], self.dates[10])
 
         # All results are the same, so just grab one column.
         column = results.unstack().iloc[:, 0].values
         check_arrays(column, self.dates[:2].values)
 
     def test_same_day_pipeline(self):
-        loader = self.loader
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
         factor = AssetID()
         asset = self.asset_ids[0]
         p = Pipeline(columns={'f': factor}, screen=factor <= asset)
@@ -269,26 +276,21 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         # The crux of this is that when we run the pipeline for a single day
         #  (i.e. start and end dates are the same) we should accurately get
         # data for the day prior.
-        result = engine.run_pipeline(p, self.dates[1], self.dates[1])
+        result = self.engine.run_pipeline(p, self.dates[1], self.dates[1])
         self.assertEqual(result['f'][0], 1.0)
 
     def test_screen(self):
-        loader = self.loader
-        finder = self.asset_finder
         asset_ids = array(self.asset_ids)
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
         num_dates = 5
         dates = self.dates[10:10 + num_dates]
 
         factor = AssetID()
         for asset_id in asset_ids:
             p = Pipeline(columns={'f': factor}, screen=factor <= asset_id)
-            result = engine.run_pipeline(p, dates[0], dates[-1])
+            result = self.engine.run_pipeline(p, dates[0], dates[-1])
 
             expected_sids = asset_ids[asset_ids <= asset_id]
-            expected_assets = finder.retrieve_all(expected_sids)
+            expected_assets = self.asset_finder.retrieve_all(expected_sids)
             expected_result = DataFrame(
                 index=MultiIndex.from_product([dates, expected_assets]),
                 data=tile(expected_sids.astype(float), [len(dates)]),
@@ -298,11 +300,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             assert_frame_equal(result, expected_result)
 
     def test_single_factor(self):
-        loader = self.loader
         assets = self.assets
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
         result_shape = (num_dates, num_assets) = (5, len(assets))
         dates = self.dates[10:10 + num_dates]
 
@@ -319,7 +317,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         ]
 
         for p in pipelines:
-            result = engine.run_pipeline(p, dates[0], dates[-1])
+            result = self.engine.run_pipeline(p, dates[0], dates[-1])
             self.assertEqual(set(result.columns), {'f'})
             assert_multi_index_is_product(
                 self, result.index, dates, assets
@@ -331,12 +329,8 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             )
 
     def test_multiple_rolling_factors(self):
-
-        loader = self.loader
         assets = self.assets
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
+
         shape = num_dates, num_assets = (5, len(assets))
         dates = self.dates[10:10 + num_dates]
 
@@ -344,7 +338,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         long_factor = RollingSumDifference(window_length=5)
         high_factor = RollingSumDifference(
             window_length=3,
-            inputs=[USEquityPricing.open, USEquityPricing.high],
+            inputs=[EquityPricing.open, EquityPricing.high],
         )
 
         pipeline = Pipeline(
@@ -354,7 +348,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
                 'high': high_factor,
             }
         )
-        results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+        results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
 
         self.assertEqual(set(results.columns), {'short', 'high', 'long'})
         assert_multi_index_is_product(
@@ -378,20 +372,16 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
 
     def test_numeric_factor(self):
         constants = self.constants
-        loader = self.loader
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
         num_dates = 5
         dates = self.dates[10:10 + num_dates]
-        high, low = USEquityPricing.high, USEquityPricing.low
-        open, close = USEquityPricing.open, USEquityPricing.close
+        high, low = EquityPricing.high, EquityPricing.low
+        open, close = EquityPricing.open, EquityPricing.close
 
         high_minus_low = RollingSumDifference(inputs=[high, low])
         open_minus_close = RollingSumDifference(inputs=[open, close])
         avg = (high_minus_low + open_minus_close) / 2
 
-        results = engine.run_pipeline(
+        results = self.engine.run_pipeline(
             Pipeline(
                 columns={
                     'high_low': high_minus_low,
@@ -432,18 +422,14 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         assets. Any assets that are filtered out should be filled with missing
         values.
         """
-        loader = self.loader
         dates = self.dates[5:8]
         assets = self.assets
         asset_ids = self.asset_ids
         constants = self.constants
         num_dates = len(dates)
         num_assets = len(assets)
-        open = USEquityPricing.open
-        close = USEquityPricing.close
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
+        open = EquityPricing.open
+        close = EquityPricing.close
 
         factor1_value = constants[open]
         factor2_value = 3.0 * (constants[open] - constants[close])
@@ -471,7 +457,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             # Test running a pipeline with a single masked factor.
             columns = {'factor1': OpenPrice(mask=mask), 'mask': mask}
             pipeline = Pipeline(columns=columns)
-            results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+            results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
 
             mask_results = results['mask'].unstack()
             check_arrays(mask_results.values, expected_mask)
@@ -487,7 +473,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             # both factors share the same mask.
             columns['factor2'] = RollingSumDifference(mask=mask)
             pipeline = Pipeline(columns=columns)
-            results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+            results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
 
             mask_results = results['mask'].unstack()
             check_arrays(mask_results.values, expected_mask)
@@ -502,23 +488,25 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             assert_frame_equal(factor2_results, factor2_expected)
 
     def test_rolling_and_nonrolling(self):
-        open_ = USEquityPricing.open
-        close = USEquityPricing.close
-        volume = USEquityPricing.volume
+        open_ = EquityPricing.open
+        close = EquityPricing.close
+        volume = EquityPricing.volume
 
         # Test for thirty days up to the last day that we think all
         # the assets existed.
         dates_to_test = self.dates[-30:]
 
-        constants = {open_: 1, close: 2, volume: 3}
+        constants = {
+            open_: 1,
+            close: 2,
+            volume: 3,
+        }
         loader = PrecomputedLoader(
             constants=constants,
             dates=self.dates,
             sids=self.asset_ids,
         )
-        engine = SimplePipelineEngine(
-            lambda column: loader, self.dates, self.asset_finder,
-        )
+        engine = SimplePipelineEngine(lambda column: loader, self.asset_finder)
 
         sumdiff = RollingSumDifference()
 
@@ -530,6 +518,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
                     'close': close.latest,
                     'volume': volume.latest,
                 },
+                domain=self.domain,
             ),
             dates_to_test[0],
             dates_to_test[-1]
@@ -566,12 +555,9 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         dates = self.dates[5:10]
         assets = self.assets
         num_dates = len(dates)
-        open = USEquityPricing.open
+        open = EquityPricing.open
         open_values = [self.constants[open]] * num_dates
         open_values_as_tuple = [(self.constants[open],)] * num_dates
-        engine = SimplePipelineEngine(
-            lambda column: self.loader, self.dates, self.asset_finder,
-        )
 
         single_output = OpenPrice(outputs=['open'])
         pipeline = Pipeline(
@@ -580,7 +566,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
                 'open_attribute': single_output.open,
             },
         )
-        results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+        results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
 
         # The instance `single_output` itself will compute a numpy.recarray
         # when added as a column to our pipeline, so we expect its output
@@ -606,11 +592,8 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         constants = self.constants
         num_dates = len(dates)
         num_assets = len(assets)
-        open = USEquityPricing.open
-        close = USEquityPricing.close
-        engine = SimplePipelineEngine(
-            lambda column: self.loader, self.dates, self.asset_finder,
-        )
+        open = EquityPricing.open
+        close = EquityPricing.close
 
         def create_expected_results(expected_value, mask):
             expected_values = where(mask, expected_value, nan)
@@ -644,7 +627,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             if mask is not NotSpecified:
                 pipeline.add(mask, 'mask')
 
-            results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+            results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
             for colname, case_column in (('open_price', open),
                                          ('close_price', close)):
                 if mask is not NotSpecified:
@@ -667,12 +650,9 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         num_dates = len(dates)
         num_assets = len(assets)
         constants = self.constants
-        engine = SimplePipelineEngine(
-            lambda column: self.loader, self.dates, self.asset_finder,
-        )
 
-        open_values = [constants[USEquityPricing.open]] * num_assets
-        close_values = [constants[USEquityPricing.close]] * num_assets
+        open_values = [constants[EquityPricing.open]] * num_assets
+        close_values = [constants[EquityPricing.close]] * num_assets
         expected_values = [list(zip(open_values, close_values))] * num_dates
         expected_results = DataFrame(
             expected_values, index=dates, columns=assets, dtype=float64,
@@ -680,7 +660,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
 
         multiple_outputs = MultipleOutputs()
         pipeline = Pipeline(columns={'instance': multiple_outputs})
-        results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+        results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
         instance_results = results['instance'].unstack()
         assert_frame_equal(instance_results, expected_results)
 
@@ -690,9 +670,6 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         num_dates = len(dates)
         num_assets = len(assets)
         constants = self.constants
-        engine = SimplePipelineEngine(
-            lambda column: self.loader, self.dates, self.asset_finder,
-        )
 
         def create_expected_results(expected_value):
             expected_values = full(
@@ -705,13 +682,13 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
                 outputs=['sum_', 'diff'], window_length=window_length,
             )
             pipeline = Pipeline(columns={'sum_': sum_, 'diff': diff})
-            results = engine.run_pipeline(pipeline, dates[0], dates[-1])
+            results = self.engine.run_pipeline(pipeline, dates[0], dates[-1])
             for colname, op in ('sum_', add), ('diff', sub):
                 output_results = results[colname].unstack()
                 output_expected = create_expected_results(
                     op(
-                        constants[USEquityPricing.open] * window_length,
-                        constants[USEquityPricing.close] * window_length,
+                        constants[EquityPricing.open] * window_length,
+                        constants[EquityPricing.close] * window_length,
                     )
                 )
                 assert_frame_equal(output_results, output_expected)
@@ -721,14 +698,17 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         class Loader1DataSet1(DataSet):
             col1 = Column(float)
             col2 = Column(float32)
+            domain = self.domain
 
         class Loader1DataSet2(DataSet):
             col1 = Column(float32)
             col2 = Column(float32)
+            domain = self.domain
 
         class Loader2DataSet(DataSet):
             col1 = Column(float32)
             col2 = Column(float32)
+            domain = self.domain
 
         constants1 = {Loader1DataSet1.col1: 1,
                       Loader1DataSet1.col2: 2,
@@ -747,7 +727,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
         engine = SimplePipelineEngine(
             lambda column:
             loader2 if column.dataset == Loader2DataSet else loader1,
-            self.dates, self.asset_finder,
+            self.asset_finder,
         )
 
         pipe_col1 = RollingSumSum(inputs=[Loader1DataSet1.col1,
@@ -769,7 +749,7 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
             ('pipe_col3', pipe_col3),
         ])
         result = engine.run_pipeline(
-            Pipeline(columns=columns),
+            Pipeline(columns=columns, domain=self.domain),
             self.dates[2],  # index is >= the largest window length - 1
             self.dates[-1]
         )
@@ -814,10 +794,19 @@ class ConstantInputTestCase(WithConstantInputs, ZiplineTestCase):
                                                   Loader2DataSet.col2)})
 
 
-class FrameInputTestCase(WithTradingEnvironment, ZiplineTestCase):
-    asset_ids = ASSET_FINDER_EQUITY_SIDS = 1, 2, 3
+# Use very large sids that don't fit in that doesn't fit in an int32 as a
+# regression test against bugs with 32 bit integer overflow in the adjustment
+# reader.
+HUGE_SID = np.iinfo('int32').max + 1
+
+
+class FrameInputTestCase(zf.WithAssetFinder,
+                         zf.WithTradingCalendars,
+                         zf.ZiplineTestCase):
+    asset_ids = ASSET_FINDER_EQUITY_SIDS = range(HUGE_SID, HUGE_SID + 3)
     start = START_DATE = Timestamp('2015-01-01', tz='utc')
     end = END_DATE = Timestamp('2015-01-31', tz='utc')
+    ASSET_FINDER_COUNTRY_CODE = 'US'
 
     @classmethod
     def init_class_fixtures(cls):
@@ -829,6 +818,7 @@ class FrameInputTestCase(WithTradingEnvironment, ZiplineTestCase):
             tz='UTC',
         )
         cls.assets = cls.asset_finder.retrieve_all(cls.asset_ids)
+        cls.domain = US_EQUITIES
 
     @lazyval
     def base_mask(self):
@@ -839,7 +829,7 @@ class FrameInputTestCase(WithTradingEnvironment, ZiplineTestCase):
 
     def test_compute_with_adjustments(self):
         dates, asset_ids = self.dates, self.asset_ids
-        low, high = USEquityPricing.low, USEquityPricing.high
+        low, high = EquityPricing.low, EquityPricing.high
         apply_idxs = [3, 10, 16]
 
         def apply_date(idx, offset=0):
@@ -884,26 +874,29 @@ class FrameInputTestCase(WithTradingEnvironment, ZiplineTestCase):
 
         high_loader = DataFrameLoader(high, high_base, adjustments)
 
-        engine = SimplePipelineEngine(
-            {low: low_loader, high: high_loader}.__getitem__,
-            self.dates,
-            self.asset_finder,
-        )
+        # Dispatch uses the concrete specializations, not generic columns.
+        get_loader = {
+            USEquityPricing.low: low_loader,
+            USEquityPricing.high: high_loader
+        }.__getitem__
+
+        engine = SimplePipelineEngine(get_loader, self.asset_finder)
 
         for window_length in range(1, 4):
             low_mavg = SimpleMovingAverage(
-                inputs=[USEquityPricing.low],
+                inputs=[EquityPricing.low],
                 window_length=window_length,
             )
             high_mavg = SimpleMovingAverage(
-                inputs=[USEquityPricing.high],
+                inputs=[EquityPricing.high],
                 window_length=window_length,
             )
             bounds = product_upper_triangle(range(window_length, len(dates)))
             for start, stop in bounds:
                 results = engine.run_pipeline(
                     Pipeline(
-                        columns={'low': low_mavg, 'high': high_mavg}
+                        columns={'low': low_mavg, 'high': high_mavg},
+                        domain=self.domain,
                     ),
                     dates[start],
                     dates[stop],
@@ -918,8 +911,9 @@ class FrameInputTestCase(WithTradingEnvironment, ZiplineTestCase):
                 assert_frame_equal(high_results, high_base.iloc[iloc_bounds])
 
 
-class SyntheticBcolzTestCase(WithAdjustmentReader,
-                             ZiplineTestCase):
+class SyntheticBcolzTestCase(zf.WithAdjustmentReader,
+                             zf.WithAssetFinder,
+                             zf.ZiplineTestCase):
     first_asset_start = Timestamp('2015-04-01', tz='UTC')
     START_DATE = Timestamp('2015-01-01', tz='utc')
     END_DATE = Timestamp('2015-08-01', tz='utc')
@@ -932,11 +926,16 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
             frequency=cls.trading_calendar.day,
             periods_between_starts=4,
             asset_lifetime=8,
+            exchange='NYSE',
         )
         return ret
 
     @classmethod
-    def make_equity_daily_bar_data(cls):
+    def make_exchanges_info(cls, *args, **kwargs):
+        return DataFrame({'exchange': ['NYSE'], 'country_code': ['US']})
+
+    @classmethod
+    def make_equity_daily_bar_data(cls, country_code, sids):
         return make_bar_data(
             cls.equity_info,
             cls.equity_daily_bar_days,
@@ -947,9 +946,14 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         super(SyntheticBcolzTestCase, cls).init_class_fixtures()
         cls.all_asset_ids = cls.asset_finder.sids
         cls.last_asset_end = cls.equity_info['end_date'].max()
-        cls.pipeline_loader = USEquityPricingLoader(
+        cls.pipeline_loader = EquityPricingLoader.without_fx(
             cls.bcolz_equity_daily_bar_reader,
             cls.adjustment_reader,
+        )
+        cls.engine = SimplePipelineEngine(
+            lambda c: cls.pipeline_loader,
+            cls.asset_finder,
+            default_domain=US_EQUITIES,
         )
 
     def write_nans(self, df):
@@ -976,17 +980,12 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         for asset in df.columns:
             if asset.start_date >= min_:
                 start = index.get_loc(asset.start_date, method='bfill')
-                df.loc[:start + 1, asset] = nan  # +1 to overwrite start_date
+                df.iloc[:start + 1, asset] = nan  # +1 to overwrite start_date
             if asset.end_date <= max_:
                 end = index.get_loc(asset.end_date)
-                df.ix[end + 1:, asset] = nan  # +1 to *not* overwrite end_date
+                df.iloc[end + 1:, asset] = nan  # +1 to *not* overwrite end_date
 
     def test_SMA(self):
-        engine = SimplePipelineEngine(
-            lambda column: self.pipeline_loader,
-            self.trading_calendar.all_sessions,
-            self.asset_finder,
-        )
         window_length = 5
         asset_ids = self.all_asset_ids
         dates = date_range(
@@ -997,11 +996,11 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         dates_to_test = dates[window_length:]
 
         SMA = SimpleMovingAverage(
-            inputs=(USEquityPricing.close,),
+            inputs=(EquityPricing.close,),
             window_length=window_length,
         )
 
-        results = engine.run_pipeline(
+        results = self.engine.run_pipeline(
             Pipeline(columns={'sma': SMA}),
             dates_to_test[0],
             dates_to_test[-1],
@@ -1013,14 +1012,11 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         expected_raw = DataFrame(
             expected_bar_values_2d(
                 dates - self.trading_calendar.day,
+                asset_ids,
                 self.equity_info,
                 'close',
             ),
-        ).rolling(
-            window_length,
-            min_periods=1,
-        ).mean(
-        ).values
+        ).rolling(window_length, min_periods=1).mean().values
 
         expected = DataFrame(
             # Truncate off the extra rows needed to compute the SMAs.
@@ -1038,11 +1034,6 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         # computed results are pretty much useless (everything is either NaN)
         # or zero, but verifying we correctly handle those corner cases is
         # valuable.
-        engine = SimplePipelineEngine(
-            lambda column: self.pipeline_loader,
-            self.trading_calendar.all_sessions,
-            self.asset_finder,
-        )
         window_length = 5
         asset_ids = self.all_asset_ids
         dates = date_range(
@@ -1053,11 +1044,11 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         dates_to_test = dates[window_length:]
 
         drawdown = MaxDrawdown(
-            inputs=(USEquityPricing.close,),
+            inputs=(EquityPricing.close,),
             window_length=window_length,
         )
 
-        results = engine.run_pipeline(
+        results = self.engine.run_pipeline(
             Pipeline(columns={'drawdown': drawdown}),
             dates_to_test[0],
             dates_to_test[-1],
@@ -1076,10 +1067,13 @@ class SyntheticBcolzTestCase(WithAdjustmentReader,
         assert_frame_equal(expected, result)
 
 
-class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
+class ParameterizedFactorTestCase(zf.WithAssetFinder,
+                                  zf.WithTradingCalendars,
+                                  zf.ZiplineTestCase):
     sids = ASSET_FINDER_EQUITY_SIDS = Int64Index([1, 2, 3])
     START_DATE = Timestamp('2015-01-31', tz='UTC')
     END_DATE = Timestamp('2015-03-01', tz='UTC')
+    ASSET_FINDER_COUNTRY_CODE = '??'
 
     @classmethod
     def init_class_fixtures(cls):
@@ -1104,23 +1098,28 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
         cls.raw_data_with_nans = cls.raw_data.where((cls.raw_data % 2) != 0)
 
         open_loader = DataFrameLoader(
-            USEquityPricing.open,
+            EquityPricing.open,
             cls.raw_data_with_nans,
         )
-        close_loader = DataFrameLoader(USEquityPricing.close, cls.raw_data)
+        close_loader = DataFrameLoader(EquityPricing.close, cls.raw_data)
         volume_loader = DataFrameLoader(
-            USEquityPricing.volume,
+            EquityPricing.volume,
             cls.raw_data * 2,
         )
 
+        loader_map = {
+            EquityPricing.open: open_loader,
+            EquityPricing.close: close_loader,
+            EquityPricing.volume: volume_loader,
+        }
+
+        def get_loader(c):
+            return loader_map[c.unspecialize()]
+
         cls.engine = SimplePipelineEngine(
-            {
-                USEquityPricing.open: open_loader,
-                USEquityPricing.close: close_loader,
-                USEquityPricing.volume: volume_loader,
-            }.__getitem__,
-            cls.dates,
+            get_loader,
             cls.asset_finder,
+            default_domain=EquitySessionDomain(cls.dates, '??'),
         )
 
     def expected_ewma(self, window_length, decay_rate):
@@ -1168,7 +1167,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
         decay_rates = [0.25, 0.5, 0.75]
         ewmas = {
             ewma_name(decay_rate): EWMA(
-                inputs=(USEquityPricing.close,),
+                inputs=(EquityPricing.close,),
                 window_length=window_length,
                 decay_rate=decay_rate,
             )
@@ -1177,7 +1176,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
 
         ewmstds = {
             ewmstd_name(decay_rate): EWMSTD(
-                inputs=(USEquityPricing.close,),
+                inputs=(EquityPricing.close,),
                 window_length=window_length,
                 decay_rate=decay_rate,
             )
@@ -1219,7 +1218,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
     @parameterized.expand(ewm_cases())
     def test_from_span(self, type_, span):
         from_span = type_.from_span(
-            inputs=[USEquityPricing.close],
+            inputs=[EquityPricing.close],
             window_length=20,
             span=span,
         )
@@ -1229,7 +1228,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
     @parameterized.expand(ewm_cases())
     def test_from_halflife(self, type_, halflife):
         from_hl = EWMA.from_halflife(
-            inputs=[USEquityPricing.close],
+            inputs=[EquityPricing.close],
             window_length=20,
             halflife=halflife,
         )
@@ -1239,7 +1238,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
     @parameterized.expand(ewm_cases())
     def test_from_com(self, type_, com):
         from_com = EWMA.from_center_of_mass(
-            inputs=[USEquityPricing.close],
+            inputs=[EquityPricing.close],
             window_length=20,
             center_of_mass=com,
         )
@@ -1260,11 +1259,11 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
                     'dv5': AverageDollarVolume(window_length=5),
                     'dv1_nan': AverageDollarVolume(
                         window_length=1,
-                        inputs=[USEquityPricing.open, USEquityPricing.volume],
+                        inputs=[EquityPricing.open, EquityPricing.volume],
                     ),
                     'dv5_nan': AverageDollarVolume(
                         window_length=5,
-                        inputs=[USEquityPricing.open, USEquityPricing.volume],
+                        inputs=[EquityPricing.open, EquityPricing.volume],
                     ),
                 }
             ),
@@ -1278,7 +1277,7 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
         expected_5 = ((self.raw_data ** 2) * 2).rolling(5).mean()[5:]
         assert_frame_equal(results['dv5'].unstack(), expected_5)
 
-        # The following two use USEquityPricing.open and .volume as inputs.
+        # The following two use EquityPricing.open and .volume as inputs.
         # The former uses self.raw_data_with_nans, and the latter uses
         # .raw_data * 2.  Thus we multiply instead of squaring as above.
         expected_1_nan = (self.raw_data_with_nans[5:]
@@ -1293,9 +1292,12 @@ class ParameterizedFactorTestCase(WithTradingEnvironment, ZiplineTestCase):
         assert_frame_equal(results['dv5_nan'].unstack(), expected_5_nan)
 
 
-class StringColumnTestCase(WithSeededRandomPipelineEngine,
-                           ZiplineTestCase):
+class StringColumnTestCase(zf.WithSeededRandomPipelineEngine,
+                           zf.ZiplineTestCase):
+    ASSET_FINDER_COUNTRY_CODE = 'US'
+    SEEDED_RANDOM_PIPELINE_DEFAULT_DOMAIN = US_EQUITIES
 
+    @skipIf(new_pandas, skip_pipeline_new_pandas)
     def test_string_classifiers_produce_categoricals(self):
         """
         Test that string-based classifiers produce pandas categoricals as their
@@ -1323,9 +1325,10 @@ class StringColumnTestCase(WithSeededRandomPipelineEngine,
         assert_frame_equal(result.c.unstack(), expected_final_result)
 
 
-class WindowSafetyPropagationTestCase(WithSeededRandomPipelineEngine,
-                                      ZiplineTestCase):
-
+class WindowSafetyPropagationTestCase(zf.WithSeededRandomPipelineEngine,
+                                      zf.ZiplineTestCase):
+    ASSET_FINDER_COUNTRY_CODE = 'US'
+    SEEDED_RANDOM_PIPELINE_DEFAULT_DOMAIN = US_EQUITIES
     SEEDED_RANDOM_PIPELINE_SEED = 5
 
     def test_window_safety_propagation(self):
@@ -1375,11 +1378,14 @@ class WindowSafetyPropagationTestCase(WithSeededRandomPipelineEngine,
             assert_equal(expected_result, results[colname])
 
 
-class PopulateInitialWorkspaceTestCase(WithConstantInputs, ZiplineTestCase):
+class PopulateInitialWorkspaceTestCase(WithConstantInputs,
+                                       zf.WithAssetFinder,
+                                       zf.WithTradingCalendars,
+                                       zf.ZiplineTestCase):
 
     @parameter_space(window_length=[3, 5], pipeline_length=[5, 10])
     def test_populate_initial_workspace(self, window_length, pipeline_length):
-        column = USEquityPricing.low
+        column = EquityPricing.low
         base_term = column.latest
 
         # Take a Z-Score here so that the precomputed term is window-safe.  The
@@ -1435,15 +1441,13 @@ class PopulateInitialWorkspaceTestCase(WithConstantInputs, ZiplineTestCase):
             return ws
 
         def dispatcher(c):
-            if c is column:
-                # the base_term should never be loaded, its initial refcount
-                # should be zero
-                return ExplodingObject()
+            self.assertIsNot(
+                c, column, "Shouldn't need to dispatch precomputed term input!"
+            )
             return self.loader
 
         engine = SimplePipelineEngine(
             dispatcher,
-            self.dates,
             self.asset_finder,
             populate_initial_workspace=populate_initial_workspace,
         )
@@ -1457,7 +1461,7 @@ class PopulateInitialWorkspaceTestCase(WithConstantInputs, ZiplineTestCase):
                     depends_on_precomputed_term_with_window,
                 'depends_on_window_of_precomputed_term':
                     depends_on_window_of_precomputed_term,
-            }),
+            }, domain=self.domain),
             self.dates[-pipeline_length],
             self.dates[-1],
         )
@@ -1496,4 +1500,180 @@ class PopulateInitialWorkspaceTestCase(WithConstantInputs, ZiplineTestCase):
                 results['depends_on_window_of_precomputed_term'],
                 precomputed_term_value,
             ),
+        )
+
+
+class ChunkedPipelineTestCase(zf.WithSeededRandomPipelineEngine,
+                              zf.ZiplineTestCase):
+
+    PIPELINE_START_DATE = Timestamp('2006-01-05', tz='UTC')
+    END_DATE = Timestamp('2006-12-29', tz='UTC')
+    ASSET_FINDER_COUNTRY_CODE = 'US'
+
+    def test_run_chunked_pipeline(self):
+        """
+        Test that running a pipeline in chunks produces the same result as if
+        it were run all at once
+        """
+
+        pipe = Pipeline(
+            columns={
+                'float': TestingDataSet.float_col.latest,
+                'custom_factor': SimpleMovingAverage(
+                    inputs=[TestingDataSet.float_col],
+                    window_length=10,
+                ),
+            },
+            domain=US_EQUITIES,
+        )
+
+        if not new_pandas:
+            # Categoricals only work on old pandas.
+            pipe.add(TestingDataSet.categorical_col.latest, 'categorical')
+
+        pipeline_result = self.run_pipeline(
+            pipe,
+            start_date=self.PIPELINE_START_DATE,
+            end_date=self.END_DATE,
+        )
+        chunked_result = self.run_chunked_pipeline(
+            pipeline=pipe,
+            start_date=self.PIPELINE_START_DATE,
+            end_date=self.END_DATE,
+            chunksize=22
+        )
+        self.assertTrue(chunked_result.equals(pipeline_result))
+
+    def test_concatenate_empty_chunks(self):
+        # Test that we correctly handle concatenating chunked pipelines when
+        # some of the chunks are empty. This is slightly tricky b/c pandas
+        # DataFrames lose dtype information when they're empty.
+
+        class FalseOnOddMonths(CustomFilter):
+            """Filter that returns False for all assets during odd months.
+            """
+            inputs = ()
+            window_length = 1
+
+            def compute(self, today, assets, out):
+                out[:] = (today.month % 2 == 0)
+
+        pipe = Pipeline(
+            columns={
+                'float': TestingDataSet.float_col.latest,
+                'bool': TestingDataSet.bool_col.latest,
+            },
+            # Define a screen that's False for all assets a significant portion
+            # of the time.
+            screen=FalseOnOddMonths(),
+            domain=US_EQUITIES,
+        )
+
+        if not new_pandas:
+            # Categoricals only work on old pandas.
+            pipe.add(TestingDataSet.categorical_col.latest, 'categorical')
+
+        self.run_chunked_pipeline(
+            pipeline=pipe,
+            start_date=self.PIPELINE_START_DATE,
+            end_date=self.END_DATE,
+            # Make chunksize small enough that some chunks are guaranteed to
+            # have no assets pass the screen.
+            chunksize=5,
+        )
+
+
+class MaximumRegressionTest(zf.WithSeededRandomPipelineEngine,
+                            zf.ZiplineTestCase):
+    ASSET_FINDER_EQUITY_SIDS = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10)
+
+    def test_no_groupby_maximum(self):
+        # This is a regression test for a bug where factor.top(1) would fail
+        # when not passed a groupby parameter.
+
+        factor = TestingDataSet.float_col.latest
+        maximum = factor.top(1)
+        pipe = Pipeline(
+            {'factor': factor, 'maximum': maximum},
+            domain=EquitySessionDomain(
+                self.trading_days,
+                self.ASSET_FINDER_COUNTRY_CODE,
+            ),
+        )
+        result = self.run_pipeline(
+            pipe, self.trading_days[-5], self.trading_days[-1]
+        )
+
+        # We should have one maximum every day.
+        maxes_per_day = result.groupby(level=0)['maximum'].sum()
+        self.assertTrue((maxes_per_day == 1).all())
+
+        # The maximum computed by pipeline should match the maximum computed by
+        # doing a groupby in pandas.
+        groupby_max = result.groupby(level=0).factor.max()
+        pipeline_max = (result.factor[result.maximum]
+                        .reset_index(level=1, drop=True))
+
+        assert_equal(groupby_max.index.values, pipeline_max.index.values)
+        assert_equal(groupby_max.values, pipeline_max.values)
+
+
+class ResolveDomainTestCase(zf.ZiplineTestCase):
+
+    def test_resolve_domain(self):
+        # we need to pass a get_loader and an asset_finder to construct
+        # SimplePipelineEngine, but do not expect to use them
+        get_loader = NamedExplodingObject(
+            'self._get_loader',
+            'SimplePipelineEngine does not currently depend on get_loader '
+            'at construction time. Update this test if it now does.'
+        )
+        asset_finder = NamedExplodingObject(
+            'self._finder',
+            'SimplePipelineEngine does not currently depend on asset_finder '
+            'at construction time. Update this test if it now does.'
+        )
+
+        engine_generic = SimplePipelineEngine(
+            get_loader, asset_finder, default_domain=GENERIC
+        )
+        engine_jp = SimplePipelineEngine(
+            get_loader, asset_finder, default_domain=JP_EQUITIES
+        )
+
+        pipe_generic = Pipeline()
+        pipe_us = Pipeline(domain=US_EQUITIES)
+
+        # the engine should resolve a pipeline that already has a domain
+        # to that domain
+        self.assertIs(
+            engine_jp.resolve_domain(pipe_us),
+            US_EQUITIES
+        )
+
+        # the engine should resolve a pipeline without a domain to the engine's
+        # default
+        self.assertIs(
+            engine_jp.resolve_domain(pipe_generic),
+            JP_EQUITIES
+        )
+
+        # a generic engine should resolve to the pipeline's domain
+        # if it has one
+        self.assertIs(
+            engine_generic.resolve_domain(pipe_us),
+            US_EQUITIES
+        )
+
+        # an engine with a default of GENERIC should raise a ValueError when
+        # trying to infer a pipeline whose domain is also GENERIC
+        with self.assertRaises(ValueError):
+            engine_generic.resolve_domain(pipe_generic)
+
+        # infer domain from the column if the pipeline and engine have
+        # a GENERIC domain
+        pipe = Pipeline({'close': USEquityPricing.close.latest})
+        self.assertIs(
+            engine_generic.resolve_domain(pipe),
+            US_EQUITIES,
         )

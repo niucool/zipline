@@ -17,19 +17,32 @@ from abc import ABCMeta, abstractmethod, abstractproperty
 class Broker(object):
     __metaclass__ = ABCMeta
 
-    @abstractproperty
+    @abstractmethod
+    def subscribe_to_market_data(self, asset):
+        pass
+
+    @property
+    @abstractmethod
+    def subscribed_assets(self):
+        pass
+
+    @property
+    @abstractmethod
     def positions(self):
         pass
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def portfolio(self):
         pass
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def account(self):
         pass
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def time_skew(self):
         pass
 
@@ -40,11 +53,13 @@ class Broker(object):
     def is_alive(self):
         pass
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def orders(self):
         pass
 
-    @abstractproperty
+    @property
+    @abstractmethod
     def transactions(self):
         pass
 

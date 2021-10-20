@@ -1,6 +1,9 @@
 from datetime import time
 from unittest import TestCase
 import pandas as pd
+from trading_calendars import get_calendar
+from trading_calendars.utils.pandas_utils import days_at_time
+
 from zipline.gens.sim_engine import (
     MinuteSimulationClock,
     SESSION_START,
@@ -8,9 +11,6 @@ from zipline.gens.sim_engine import (
     BAR,
     SESSION_END
 )
-
-from zipline.utils.calendars import get_calendar
-from zipline.utils.calendars.trading_calendar import days_at_time
 
 
 class TestClock(TestCase):
@@ -20,11 +20,11 @@ class TestClock(TestCase):
 
         # july 15 is friday, so there are 3 sessions in this range (15, 18, 19)
         cls.sessions = cls.nyse_calendar.sessions_in_range(
-            pd.Timestamp("2016-07-15"),
-            pd.Timestamp("2016-07-19")
+            pd.Timestamp("2016-07-15", tz="utc"),
+            pd.Timestamp("2016-07-19", tz="utc")
         )
 
-        trading_o_and_c = cls.nyse_calendar.schedule.ix[cls.sessions]
+        trading_o_and_c = cls.nyse_calendar.schedule.loc[cls.sessions]
         cls.opens = trading_o_and_c['market_open']
         cls.closes = trading_o_and_c['market_close']
 

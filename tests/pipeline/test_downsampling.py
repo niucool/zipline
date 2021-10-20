@@ -1,23 +1,35 @@
 """
 Tests for Downsampled Filters/Factors/Classifiers
 """
-import pandas as pd
-from pandas.util.testing import assert_frame_equal
+from functools import partial
 
+import pandas as pd
+from pandas.testing import assert_frame_equal
+
+from zipline.errors import NoFurtherDataError
 from zipline.pipeline import (
     Pipeline,
     CustomFactor,
     CustomFilter,
     CustomClassifier,
+    SimplePipelineEngine,
 )
 from zipline.pipeline.data.testing import TestingDataSet
+from zipline.pipeline.domain import (
+    CA_EQUITIES,
+    EquitySessionDomain,
+    GB_EQUITIES,
+    US_EQUITIES,
+)
 from zipline.pipeline.factors import SimpleMovingAverage
 from zipline.pipeline.filters.smoothing import All
-from zipline.testing import ZiplineTestCase, parameter_space
+from zipline.testing import ZiplineTestCase, parameter_space, ExplodingObject
 from zipline.testing.fixtures import (
     WithTradingSessions,
     WithSeededRandomPipelineEngine,
+    WithAssetFinder,
 )
+from zipline.utils.classproperty import classproperty
 from zipline.utils.input_validation import _qualified_name
 from zipline.utils.numpy_utils import int64_dtype
 
@@ -44,11 +56,11 @@ class NDaysAgoClassifier(CustomClassifier):
         out[:] = cats[0]
 
 
-class ComputeExtraRowsTestcase(WithTradingSessions, ZiplineTestCase):
+class ComputeExtraRowsTestCase(WithTradingSessions, ZiplineTestCase):
 
     DATA_MIN_DAY = pd.Timestamp('2012-06', tz='UTC')
     DATA_MAX_DAY = pd.Timestamp('2015', tz='UTC')
-    TRADING_CALENDAR_STRS = ('NYSE',)
+    TRADING_CALENDAR_STRS = ('NYSE', 'LSE', 'TSX')
 
     # Test with different window_lengths to ensure that window length is not
     # used when calculating exra rows for the top-level term.
@@ -161,7 +173,7 @@ class ComputeExtraRowsTestcase(WithTradingSessions, ZiplineTestCase):
         # Simulate requesting computation where the unaltered lookback would
         # land on the last date of 2012. The downsampled terms should request
         # enough extra rows to push us back to the first known date, which is
-        # in the middle of 2012
+        # in the middle of 2012.
         for i in range(0, 30, 5):
             start_session = sessions_in_2013[i]
             self.check_extra_row_calculations(
@@ -176,6 +188,32 @@ class ComputeExtraRowsTestcase(WithTradingSessions, ZiplineTestCase):
                 base_terms,
                 all_sessions,
                 start_session,
+                end_session,
+                min_extra_rows=i + 1,
+                expected_extra_rows=i + 1,
+            )
+
+        # Simulate requesting computation where the unaltered lookback would
+        # land prior to the first date of 2012. The downsampled terms will fail
+        # to request enough extra rows.
+        for i in range(0, 30, 5):
+            with self.assertRaisesRegex(
+                NoFurtherDataError,
+                r'\s*Insufficient data to compute Pipeline'
+            ):
+                self.check_extra_row_calculations(
+                    downsampled_terms,
+                    all_sessions,
+                    all_sessions[i],
+                    end_session,
+                    min_extra_rows=i + 1,
+                    expected_extra_rows=i + 1,
+                )
+
+            self.check_extra_row_calculations(
+                base_terms,
+                all_sessions,
+                all_sessions[i],
                 end_session,
                 min_extra_rows=i + 1,
                 expected_extra_rows=i + 1,
@@ -564,6 +602,19 @@ class DownsampledPipelineTestCase(WithSeededRandomPipelineEngine,
     END_DATE = pd.Timestamp('2015-01-06', tz='UTC')
 
     ASSET_FINDER_EQUITY_SIDS = tuple(range(10))
+    DOMAIN = US_EQUITIES
+
+    @classproperty
+    def ASSET_FINDER_COUNTRY_CODE(cls):
+        return cls.DOMAIN.country_code
+
+    @classproperty
+    def SEEDED_RANDOM_PIPELINE_DEFAULT_DOMAIN(cls):
+        return cls.DOMAIN
+
+    @classproperty
+    def all_sessions(cls):
+        return cls.DOMAIN.all_sessions()
 
     def check_downsampled_term(self, term):
 
@@ -575,7 +626,7 @@ class DownsampledPipelineTestCase(WithSeededRandomPipelineEngine,
         # 16 17 18 19 20 21 22
         # 23 24 25 26 27 28 29
         # 30
-        all_sessions = self.nyse_sessions
+        all_sessions = self.all_sessions
         compute_dates = all_sessions[
             all_sessions.slice_indexer('2014-06-05', '2015-01-06')
         ]
@@ -598,19 +649,19 @@ class DownsampledPipelineTestCase(WithSeededRandomPipelineEngine,
 
         expected_results = {
             'year': (raw_term_results
-                     .groupby(pd.TimeGrouper('AS'))
+                     .groupby(pd.Grouper(freq='AS'))
                      .first()
                      .reindex(compute_dates, method='ffill')),
             'quarter': (raw_term_results
-                        .groupby(pd.TimeGrouper('QS'))
+                        .groupby(pd.Grouper(freq='QS'))
                         .first()
                         .reindex(compute_dates, method='ffill')),
             'month': (raw_term_results
-                      .groupby(pd.TimeGrouper('MS'))
+                      .groupby(pd.Grouper(freq='MS'))
                       .first()
                       .reindex(compute_dates, method='ffill')),
             'week': (raw_term_results
-                     .groupby(pd.TimeGrouper('W', label='left'))
+                     .groupby(pd.Grouper(freq='W', label='left'))
                      .first()
                      .reindex(compute_dates, method='ffill')),
         }
@@ -684,3 +735,84 @@ class DownsampledPipelineTestCase(WithSeededRandomPipelineEngine,
             "for argument 'frequency', but got 'bad' instead."
         ).format(_qualified_name(f.downsample))
         self.assertEqual(str(e.exception), expected)
+
+
+class DownsampledGBPipelineTestCase(DownsampledPipelineTestCase):
+    DOMAIN = GB_EQUITIES
+
+
+class DownsampledCAPipelineTestCase(DownsampledPipelineTestCase):
+    DOMAIN = CA_EQUITIES
+
+
+class TestDownsampledRowwiseOperation(WithAssetFinder, ZiplineTestCase):
+
+    T = partial(pd.Timestamp, tz='utc')
+    START_DATE = T('2014-01-01')
+    END_DATE = T('2014-02-01')
+    HALF_WAY_POINT = T('2014-01-15')
+
+    dates = pd.date_range(START_DATE, END_DATE)
+
+    ASSET_FINDER_COUNTRY_CODE = '??'
+
+    class SidFactor(CustomFactor):
+        inputs = ()
+        window_length = 1
+
+        def compute(self, today, assets, out):
+            out[:] = assets
+
+    factor = SidFactor()
+
+    @classmethod
+    def init_class_fixtures(cls):
+        super(TestDownsampledRowwiseOperation, cls).init_class_fixtures()
+        cls.pipeline_engine = SimplePipelineEngine(
+            get_loader=lambda c: ExplodingObject(),
+            asset_finder=cls.asset_finder,
+            default_domain=EquitySessionDomain(
+                cls.dates,
+                country_code=cls.ASSET_FINDER_COUNTRY_CODE,
+            ),
+        )
+
+    @classmethod
+    def make_equity_info(cls):
+        start = cls.START_DATE - pd.Timedelta(days=1)
+        end = cls.END_DATE
+        early_end = cls.HALF_WAY_POINT
+        return pd.DataFrame(
+            [['A',    'Ayy Inc.', start,       end, 'E'],
+             ['B', 'early end',   start, early_end, 'E'],
+             ['C',      'C Inc.', start,       end, 'E']],
+            index=[ord('A'), ord('B'), ord('C')],
+            columns=(
+                'symbol',
+                'asset_name',
+                'start_date',
+                'end_date',
+                'exchange',
+            ),
+        )
+
+    def test_downsampled_rank(self):
+        downsampled_rank = self.factor.rank().downsample('month_start')
+        pipeline = Pipeline({'rank': downsampled_rank})
+
+        results_month_start = self.pipeline_engine.run_pipeline(
+            pipeline,
+            self.START_DATE,
+            self.END_DATE,
+        )
+
+        half_way_start = self.HALF_WAY_POINT + pd.Timedelta(days=1)
+        results_halfway_start = self.pipeline_engine.run_pipeline(
+            pipeline,
+            half_way_start,
+            self.END_DATE,
+        )
+
+        results_month_start_aligned = results_month_start.loc[half_way_start:]
+
+        assert_frame_equal(results_month_start_aligned, results_halfway_start)

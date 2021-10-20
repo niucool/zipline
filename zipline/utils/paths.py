@@ -6,7 +6,7 @@ Otherwise default to expanduser(~/.zipline)
 """
 from errno import EEXIST
 import os
-from os.path import exists, expanduser, join
+from os.path import exists, expanduser, join, expandvars
 
 import pandas as pd
 
@@ -48,7 +48,7 @@ def ensure_directory_containing(path):
 def ensure_file(path):
     """
     Ensure that a file exists. This will create any parent directories needed
-    and create an empty file if it does not exists.
+    and create an empty file if it does not exist.
 
     Parameters
     ----------
@@ -57,6 +57,22 @@ def ensure_file(path):
     """
     ensure_directory_containing(path)
     open(path, 'a+').close()  # touch the file
+
+
+def update_modified_time(path, times=None):
+    """
+    Updates the modified time of an existing file. This will create any
+    parent directories needed and create an empty file if it does not exist.
+
+    Parameters
+    ----------
+    path : str
+        The file path to update.
+    times : tuple
+        A tuple of size two; access time and modified time
+    """
+    ensure_directory_containing(path)
+    os.utime(path, times)
 
 
 def last_modified_time(path):
@@ -110,7 +126,7 @@ def zipline_root(environ=None):
 
     root = environ.get('ZIPLINE_ROOT', None)
     if root is None:
-        root = expanduser('~/.zipline')
+        root = expandvars(expanduser(join('~','.zipline3')))
 
     return root
 

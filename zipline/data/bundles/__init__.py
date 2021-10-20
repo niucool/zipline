@@ -1,5 +1,9 @@
 # These imports are necessary to force module-scope register calls to happen.
 from . import quandl  # noqa
+from . import csvdir  # noqa
+from . import alpaca_api
+from . import alpha_vantage_api
+
 from .core import (
     UnknownBundle,
     bundles,
@@ -12,7 +16,7 @@ from .core import (
     to_bundle_ingest_dirname,
     unregister,
 )
-from .csvdir import csvdir_equities
+
 
 __all__ = [
     'UnknownBundle',
@@ -25,5 +29,4 @@ __all__ = [
     'register',
     'to_bundle_ingest_dirname',
     'unregister',
-    'csvdir_equities',
 ]

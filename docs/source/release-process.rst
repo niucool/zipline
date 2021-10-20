@@ -1,14 +1,14 @@
-Zipline Release Process
------------------------
+Release Process
+===========================================
 
 .. include:: dev-doc-message.txt
 
 
 Updating the Release Notes
-~~~~~~~~~~~~~~~~~~~~~~~~~~
+-------------------------------------
 
 When we are ready to ship a new release of zipline, edit the :doc:`releases`
-page. We will have been maintaining a whatsnew file while working on the release
+page. We will have been maintaining a ``whatsnew`` file while working on the release
 with the new version. First, find that file in:
 ``docs/source/whatsnew/<version>.txt``. It will be the highest version number.
 Edit the release date field to be today's date in the format:
@@ -19,7 +19,7 @@ Edit the release date field to be today's date in the format:
 
 
 for example, November 6, 2015.
-Remove the active development warning from the whatsnew, since it will no
+Remove the active development warning from the ``whatsnew``, since it will no
 longer be pending release.
 Update the title of the release from "Development" to "Release x.x.x" and
 update the underline of the title to match the title's width.
@@ -36,7 +36,7 @@ To build and view the docs locally, run:
    $ {BROWSER} build/html/index.html
 
 Updating the Python stub files
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-------------------------------------
 
 PyCharm and other linters and type checkers can use `Python stub files
 <https://www.python.org/dev/peps/pep-0484/#stub-files>`__ for type hinting. For
@@ -62,7 +62,7 @@ the following to generate any stub files:
    should be added to that header.
 
 Updating the ``__version__``
-~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+-------------------------------------
 
 We use `versioneer <https://github.com/warner/python-versioneer>`__ to
 manage the ``__version__`` and ``setup.py`` version. This means that we pull
@@ -84,7 +84,7 @@ Next, click the "Draft a new release" button on the `zipline releases page
 choose the tag you just pushed, and publish the release.
 
 Uploading PyPI packages
-~~~~~~~~~~~~~~~~~~~~~~~
+-------------------------------------
 
 ``sdist``
 ^^^^^^^^^
@@ -119,30 +119,13 @@ This should print the version we are expecting to release.
 Now that we have tested the package locally, it should be tested using the test
 PyPI server.
 
-Edit your ``~/.pypirc`` file to look like:
-
-::
-
-   [distutils]
-   index-servers =
-       pypi
-       pypitest
-
-   [pypi]
-   username:
-   password:
-
-   [pypitest]
-   repository: https://testpypi.python.org/pypi
-   username:
-   password:
-
-after that, run:
-
 .. code-block:: bash
 
-   $ python setup.py sdist upload -r pypitest
+   $ pip install twine
+   $ twine upload --repository-url https://test.pypi.org/legacy/ dist/zipline-<version-number>.tar.gz
 
+Twine will prompt you for a username and password, which you should have access
+to if you're authorized to push Zipline releases.
 
 .. note::
 
@@ -162,7 +145,7 @@ create a new virtualenv, ``cd`` into a clean directory and then run:
 
 .. code-block:: bash
 
-   $ pip install --extra-index-url https://testpypi.python.org/pypi zipline
+   $ pip install --extra-index-url https://test.pypi.org/simple zipline
    $ python -c 'import zipline;print(zipline.__version__)'
 
 
@@ -173,19 +156,19 @@ Now that we have tested locally and on PyPI test, it is time to upload to PyPI:
 
 .. code-block:: bash
 
-   $ python setup.py sdist upload
+   $ twine upload dist/zipline-<version-number>.tar.gz
 
 ``bdist``
-^^^^^^^^^
+)))))))))))))))))))))))))))))
 
 Because zipline now supports multiple versions of numpy, we're not building
 binary wheels, since they are not tagged with the version of numpy with which
 they were compiled.
 
 Documentation
-~~~~~~~~~~~~~
+-------------------------------------
 
-To update `zipline.io <http://www.zipline.io/index.html>`__, checkout the
+To update `zipline.io <https://www.zipline.io>`__, checkout the
 latest master and run:
 
 .. code-block:: python
@@ -213,19 +196,20 @@ Once we are happy, push the updated docs to the GitHub ``gh-pages`` branch.
    $ git commit -m "DOC: update zipline.io"
    $ git push origin gh-pages
 
-`zipline.io <http://www.zipline.io/index.html>`__ will update in a few moments.
+`zipline.io <https://www.zipline.io>`__ will update in a few moments.
 
 Uploading conda packages
-~~~~~~~~~~~~~~~~~~~~~~~~
+-------------------------------------
 
-Travis and AppVeyor build zipline conda packages for us.  Once they have built
-and uploaded to anaconda.org the packages (and their dependencies) for the
+`Travis <https://travis-ci.org/quantopian/zipline>`__ and
+`AppVeyor <https://ci.appveyor.com/project/quantopian/zipline/branch/master>`__
+build zipline conda packages for us (for Linux/OSX and Windows respectively).
+Once they have built and uploaded to anaconda.org the zipline packages for the
 release commit to master, we should move those packages from the "ci" label to
-the "main" label.  You can do this from the anaconda.org web interface.  This
-is also a good time to remove all the old "ci" packages from anaconda.
-
-Travis and AppVeyor only build and upload linux-64 and win-64 packages.  We'll
-need to build and upload osx-64 packages manually on an OSX machine.
+the "main" label. We should also do this for any packages we uploaded for
+zipline's dependencies. You can do this from the
+`anaconda.org web interface <https://anaconda.org/Quantopian/repo>`__.
+This is also a good time to remove all the old "ci" packages from anaconda.
 
 To build the conda packages for zipline locally, run:
 
@@ -247,15 +231,15 @@ If you would like to test this command by uploading to a different user, this
 may be specified with the ``--user`` flag.
 
 Next Commit
-~~~~~~~~~~~
+-------------------------------------
 
-Push a new commit post-release that adds the whatsnew for the next release,
+Push a new commit post-release that adds the ``whatsnew`` for the next release,
 which should be titled according to a micro version increment. If that next
 release turns out to be a major/minor version increment, the file can be
 renamed when that's decided. You can use ``docs/source/whatsnew/skeleton.txt``
 as a template for the new file.
 
-Include the whatsnew file in ``docs/source/releases.rst``. New releases should
+Include the ``whatsnew`` file in ``docs/source/releases.rst``. New releases should
 appear at the top. The syntax for this is:
 
 ::

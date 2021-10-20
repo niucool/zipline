@@ -21,6 +21,7 @@ from textwrap import dedent
 from lru import LRU
 import bcolz
 from bcolz import ctable
+import h5py
 from intervaltree import IntervalTree
 import logbook
 import numpy as np
@@ -29,6 +30,7 @@ from pandas import HDFStore
 import tables
 from six import with_metaclass
 from toolz import keymap, valmap
+from trading_calendars import get_calendar
 
 from zipline.data._minute_bar_internal import (
     minute_value,
@@ -37,11 +39,10 @@ from zipline.data._minute_bar_internal import (
 )
 
 from zipline.gens.sim_engine import NANOS_IN_MINUTE
-
-from zipline.data.bar_reader import BarReader, NoDataOnDate
-from zipline.data.us_equity_pricing import check_uint32_safe
-from zipline.utils.calendars import get_calendar
+from zipline.data.bar_reader import BarReader, NoDataForSid, NoDataOnDate
+from zipline.data.bcolz_daily_bars import check_uint32_safe
 from zipline.utils.cli import maybe_show_progress
+from zipline.utils.compat import mappingproxy
 from zipline.utils.memoize import lazyval
 
 
@@ -79,7 +80,7 @@ def _calc_minute_index(market_opens, minutes_per_day):
         start_ix = minutes_per_day * i
         end_ix = start_ix + minutes_per_day
         minutes[start_ix:end_ix] = minute_values
-    return pd.to_datetime(minutes, utc=True, box=True)
+    return pd.to_datetime(minutes, utc=True)
 
 
 def _sid_subdir_path(sid):
@@ -90,13 +91,13 @@ def _sid_subdir_path(sid):
     The number in each directory is designed to support at least 100000
     equities.
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     sid : int
         Asset identifier.
 
-    Returns:
-    --------
+    Returns
+    -------
     out : string
         A path for the bcolz rootdir, including subdirectory prefixes based on
         the padded string representation of the given sid.
@@ -131,10 +132,10 @@ def convert_cols(cols, scale_factor, sid, invalid_data_behavior):
         If 'warn', logs a warning and filters out incompatible values.
         If 'ignore', silently filters out incompatible values.
     """
-    scaled_opens = np.nan_to_num(cols['open']) * scale_factor
-    scaled_highs = np.nan_to_num(cols['high']) * scale_factor
-    scaled_lows = np.nan_to_num(cols['low']) * scale_factor
-    scaled_closes = np.nan_to_num(cols['close']) * scale_factor
+    scaled_opens = (np.nan_to_num(cols['open']) * scale_factor).round()
+    scaled_highs = (np.nan_to_num(cols['high']) * scale_factor).round()
+    scaled_lows = (np.nan_to_num(cols['low']) * scale_factor).round()
+    scaled_closes = (np.nan_to_num(cols['close']) * scale_factor).round()
 
     exclude_mask = np.zeros_like(scaled_opens, dtype=bool)
 
@@ -187,7 +188,7 @@ class BcolzMinuteBarMetadata(object):
     ohlc_ratio : int
          The factor by which the pricing data is multiplied so that the
          float data can be stored as an integer.
-    calendar :  zipline.utils.calendars.trading_calendar.TradingCalendar
+    calendar :  trading_calendars.trading_calendar.TradingCalendar
         The TradingCalendar on which the minute bars are based.
     start_session : datetime
         The first trading session in the data set.
@@ -233,7 +234,7 @@ class BcolzMinuteBarMetadata(object):
             else:
                 # No calendar info included in older versions, so
                 # default to NYSE.
-                calendar = get_calendar('NYSE')
+                calendar = get_calendar('XNYS')
 
                 start_session = pd.Timestamp(
                     raw_data['first_trading_day'], tz='UTC')
@@ -358,7 +359,7 @@ class BcolzMinuteBarWriter(object):
     rootdir : string
         Path to the root directory into which to write the metadata and
         bcolz subdirectories.
-    calendar : zipline.utils.calendars.trading_calendar.TradingCalendar
+    calendar : trading_calendars.trading_calendar.TradingCalendar
         The trading calendar on which to base the minute bars. Used to
         get the market opens used as a starting point for each periodic
         span of minutes in the index, and the market closes that
@@ -517,13 +518,13 @@ class BcolzMinuteBarWriter(object):
 
     def sidpath(self, sid):
         """
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             Asset identifier.
 
-        Returns:
-        --------
+        Returns
+        -------
         out : string
             Full path to the bcolz rootdir for the given sid.
         """
@@ -532,13 +533,13 @@ class BcolzMinuteBarWriter(object):
 
     def last_date_in_output_for_sid(self, sid):
         """
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             Asset identifier.
 
-        Returns:
-        --------
+        Returns
+        -------
         out : pd.Timestamp
             The midnight of the last date written in to the output for the
             given sid.
@@ -561,8 +562,8 @@ class BcolzMinuteBarWriter(object):
         """
         Create empty ctable for given path.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         path : string
             The path to rootdir of the new ctable.
         """
@@ -624,8 +625,8 @@ class BcolzMinuteBarWriter(object):
         including the specified date) will be padded with `minute_per_day`
         worth of zeros
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             The asset identifier for the data being written.
         date : datetime-like
@@ -643,7 +644,7 @@ class BcolzMinuteBarWriter(object):
             # No need to pad.
             return
 
-        if last_date == pd.NaT:
+        if pd.isnull(last_date):
             # If there is no data, determine how many days to add so that
             # desired days are written to the correct slots.
             days_to_zerofill = tds[tds.slice_indexer(end=date)]
@@ -703,8 +704,8 @@ class BcolzMinuteBarWriter(object):
         If the length of the bcolz ctable is not exactly to the date before
         the first day provided, fill the ctable with 0s up to that date.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             The asset identifer for the data being written.
         df : pd.DataFrame
@@ -736,8 +737,8 @@ class BcolzMinuteBarWriter(object):
         If the length of the bcolz ctable is not exactly to the date before
         the first day provided, fill the ctable with 0s up to that date.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             The asset identifier for the data being written.
         dts : datetime64 array
@@ -763,8 +764,8 @@ class BcolzMinuteBarWriter(object):
         """
         Internal method for `write_cols` and `write`.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             The asset identifier for the data being written.
         dts : datetime64 array
@@ -796,7 +797,9 @@ class BcolzMinuteBarWriter(object):
 
         all_minutes = self._minute_index
         # Get the latest minute we wish to write to the ctable
-        last_minute_to_write = pd.Timestamp(dts[-1], tz='UTC')
+        last_minute_to_write = pd.Timestamp(dts[-1])
+        if not last_minute_to_write.tzname():
+            last_minute_to_write = last_minute_to_write.tz_localize('utc')
 
         # In the event that we've already written some minutely data to the
         # ctable, guard against overwriting that data.
@@ -887,8 +890,8 @@ class BcolzMinuteBarReader(MinuteBarReader):
     """
     Reader for data written by BcolzMinuteBarWriter
 
-    Parameters:
-    -----------
+    Parameters
+    ----------
     rootdir : string
         The root directory containing the metadata and asset bcolz
         directories.
@@ -898,8 +901,23 @@ class BcolzMinuteBarReader(MinuteBarReader):
     zipline.data.minute_bars.BcolzMinuteBarWriter
     """
     FIELDS = ('open', 'high', 'low', 'close', 'volume')
+    DEFAULT_MINUTELY_SID_CACHE_SIZES = {
+        'close': 3000,
+        'open': 1550,
+        'high': 1550,
+        'low': 1550,
+        'volume': 1550,
+    }
+    assert set(FIELDS) == set(DEFAULT_MINUTELY_SID_CACHE_SIZES), \
+        "FIELDS should match DEFAULT_MINUTELY_SID_CACHE_SIZES keys"
 
-    def __init__(self, rootdir, sid_cache_size=1000):
+    # Wrap the defaults in proxy so that we don't accidentally mutate them in
+    # place in the constructor. If a user wants to change the defaults, they
+    # can do so by mutating DEFAULT_MINUTELY_SID_CACHE_SIZES.
+    _default_proxy = mappingproxy(DEFAULT_MINUTELY_SID_CACHE_SIZES)
+
+    def __init__(self, rootdir, sid_cache_sizes=_default_proxy):
+
         self._rootdir = rootdir
 
         metadata = self._get_metadata()
@@ -931,7 +949,7 @@ class BcolzMinuteBarReader(MinuteBarReader):
         self._minutes_per_day = metadata.minutes_per_day
 
         self._carrays = {
-            field: LRU(sid_cache_size)
+            field: LRU(sid_cache_sizes[field])
             for field in self.FIELDS
         }
 
@@ -980,8 +998,8 @@ class BcolzMinuteBarReader(MinuteBarReader):
         based on the regular period of minutes per day and the market close
         do not match.
 
-        Returns:
-        --------
+        Returns
+        -------
         List of DatetimeIndex representing the minutes to exclude because
         of early closes.
         """
@@ -1057,9 +1075,13 @@ class BcolzMinuteBarReader(MinuteBarReader):
         try:
             carray = self._carrays[field][sid]
         except KeyError:
-            carray = self._carrays[field][sid] = \
-                bcolz.carray(rootdir=self._get_carray_path(sid, field),
-                             mode='r')
+            try:
+                carray = self._carrays[field][sid] = bcolz.carray(
+                    rootdir=self._get_carray_path(sid, field),
+                    mode='r',
+                )
+            except IOError:
+                raise NoDataForSid('No minute data for sid {}.'.format(sid))
 
         return carray
 
@@ -1080,8 +1102,8 @@ class BcolzMinuteBarReader(MinuteBarReader):
         """
         Retrieve the pricing info for the given sid, dt, and field.
 
-        Parameters:
-        -----------
+        Parameters
+        ----------
         sid : int
             Asset identifier.
         dt : datetime-like
@@ -1090,8 +1112,8 @@ class BcolzMinuteBarReader(MinuteBarReader):
             The type of pricing data to retrieve.
             ('open', 'high', 'low', 'close', 'volume')
 
-        Returns:
-        --------
+        Returns
+        -------
         out : float|int
 
         The market data for the given sid, dt, and field coordinates.
@@ -1338,7 +1360,7 @@ class H5MinuteBarUpdateWriter(object):
         with HDFStore(self._path, 'w',
                       complevel=self._complevel, complib=self._complib) \
                 as store:
-            panel = pd.Panel.from_dict(dict(frames))
+            panel = pd.concat(dict(frames), axis=1)
             panel.to_hdf(store, 'updates')
         with tables.open_file(self._path, mode='r+') as h5file:
             h5file.set_node_attr('/', 'version', 0)
@@ -1354,8 +1376,46 @@ class H5MinuteBarUpdateReader(MinuteBarUpdateReader):
         The path of the HDF5 file from which to source data.
     """
     def __init__(self, path):
-        self._panel = pd.read_hdf(path)
+        try:
+            self._panel = pd.read_hdf(path)
+            return
+        except TypeError:
+            pass
+
+        # There is a bug in `pandas.read_hdf` whereby in Python 3 it fails to
+        # read the timezone attr of an h5 file if that file was written in
+        # Python 2. Until zipline has dropped Python 2 entirely we are at risk
+        # of hitting this issue. For now, use h5py to read the file instead.
+        # The downside of using h5py directly is that we need to interpret the
+        # attrs manually when creating our panel (specifically the tz attr),
+        # but since we know exactly how the file was written this should be
+        # pretty straightforward.
+        with h5py.File(path, 'r') as f:
+            updates = f['updates']
+            values = updates['block0_values']
+            items = updates['axis0']
+            major = updates['axis1']
+            minor = updates['axis2']
+
+            # Our current version of h5py is unable to read the tz attr in the
+            # tests as it was written by HDFStore. This is fixed in version
+            # 2.10.0 of h5py, but that requires >=Python3.7 on conda, so until
+            # then we should be safe to assume UTC.
+            try:
+                tz = major.attrs['tz'].decode()
+            except OSError:
+                tz = 'UTC'
+
+            self._panel = pd.Panel(
+                data=np.array(values).T,
+                items=np.array(items),
+                major_axis=pd.DatetimeIndex(major, tz=tz, freq='T'),
+                minor_axis=np.array(minor).astype('U'),
+            )
 
     def read(self, dts, sids):
-        panel = self._panel[sids, dts, :]
-        return panel.iteritems()
+        result = []
+        for sid in sids:
+            result.append((sid, self._panel[sid].loc[dts]))
+
+        return iter(result)

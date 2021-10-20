@@ -1,5 +1,5 @@
 #
-# Copyright 2016 Quantopian, Inc.
+# Copyright 2019 Quantopian, Inc.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -109,6 +109,8 @@ def _build_offset(offset, kwargs, default):
     """
     Builds the offset argument for event rules.
     """
+    # Filter down to just kwargs that were actually passed.
+    kwargs = {k: v for k, v in six.iteritems(kwargs) if v is not None}
     if offset is None:
         if not kwargs:
             return default  # use the default.
@@ -223,7 +225,7 @@ class Event(namedtuple('Event', ['rule', 'callback'])):
     with the current algorithm context, data, and datetime only when the rule
     is triggered.
     """
-    def __new__(cls, rule=None, callback=None):
+    def __new__(cls, rule, callback=None):
         callback = callback or (lambda *args, **kwargs: None)
         return super(cls, cls).__new__(cls, rule=rule, callback=callback)
 
@@ -236,6 +238,20 @@ class Event(namedtuple('Event', ['rule', 'callback'])):
 
 
 class EventRule(six.with_metaclass(ABCMeta)):
+    """A rule defining when a scheduled function should execute.
+    """
+    # Instances of EventRule are assigned a calendar instance when scheduling
+    # a function.
+    _cal = None
+
+    @property
+    def cal(self):
+        return self._cal
+
+    @cal.setter
+    def cal(self, value):
+        self._cal = value
+
     @abstractmethod
     def should_trigger(self, dt):
         """
@@ -300,6 +316,15 @@ class ComposedRule(StatelessRule):
         second rule if the first one returns False.
         """
         return first_should_trigger(dt) and second_should_trigger(dt)
+
+    @property
+    def cal(self):
+        return self.first.cal
+
+    @cal.setter
+    def cal(self, value):
+        # Thread the calendar through to the underlying rules.
+        self.first.cal = self.second.cal = value
 
 
 class Always(StatelessRule):
@@ -465,7 +490,8 @@ class TradingDayOfWeekRule(six.with_metaclass(ABCMeta, StatelessRule)):
         sessions = self.cal.all_sessions
         return set(
             pd.Series(data=sessions)
-            .groupby([sessions.year, sessions.weekofyear])
+            # Group by ISO year (0) and week (1)
+            .groupby(sessions.map(lambda x: x.isocalendar()[0:2]))
             .nth(self.td_delta)
             .astype(np.int64)
         )
@@ -546,11 +572,14 @@ class StatefulRule(EventRule):
     def __init__(self, rule=None):
         self.rule = rule or Always()
 
-    def new_should_trigger(self, callable_):
-        """
-        Replace the should trigger implementation for the current rule.
-        """
-        self.should_trigger = callable_
+    @property
+    def cal(self):
+        return self.rule.cal
+
+    @cal.setter
+    def cal(self, value):
+        # Thread the calendar through to the underlying rule.
+        self.rule.cal = value
 
 
 class OncePerDay(StatefulRule):
@@ -580,28 +609,164 @@ class OncePerDay(StatefulRule):
 # Factory API
 
 class date_rules(object):
-    every_day = Always
+    """
+    Factories for date-based :func:`~zipline.api.schedule_function` rules.
+
+    See Also
+    --------
+    :func:`~zipline.api.schedule_function`
+    """
+
+    @staticmethod
+    def every_day():
+        """Create a rule that triggers every day.
+
+        Returns
+        -------
+        rule : zipline.utils.events.EventRule
+        """
+        return Always()
 
     @staticmethod
     def month_start(days_offset=0):
+        """
+        Create a rule that triggers a fixed number of trading days after the
+        start of each month.
+
+        Parameters
+        ----------
+        days_offset : int, optional
+            Number of trading days to wait before triggering each
+            month. Default is 0, i.e., trigger on the first trading day of the
+            month.
+
+        Returns
+        -------
+        rule : zipline.utils.events.EventRule
+        """
         return NthTradingDayOfMonth(n=days_offset)
 
     @staticmethod
     def month_end(days_offset=0):
+        """
+        Create a rule that triggers a fixed number of trading days before the
+        end of each month.
+
+        Parameters
+        ----------
+        days_offset : int, optional
+            Number of trading days prior to month end to trigger. Default is 0,
+            i.e., trigger on the last day of the month.
+
+        Returns
+        -------
+        rule : zipline.utils.events.EventRule
+        """
         return NDaysBeforeLastTradingDayOfMonth(n=days_offset)
 
     @staticmethod
     def week_start(days_offset=0):
+        """
+        Create a rule that triggers a fixed number of trading days after the
+        start of each week.
+
+        Parameters
+        ----------
+        days_offset : int, optional
+            Number of trading days to wait before triggering each week. Default
+            is 0, i.e., trigger on the first trading day of the week.
+        """
         return NthTradingDayOfWeek(n=days_offset)
 
     @staticmethod
     def week_end(days_offset=0):
+        """
+        Create a rule that triggers a fixed number of trading days before the
+        end of each week.
+
+        Parameters
+        ----------
+        days_offset : int, optional
+            Number of trading days prior to week end to trigger. Default is 0,
+            i.e., trigger on the last trading day of the week.
+        """
         return NDaysBeforeLastTradingDayOfWeek(n=days_offset)
 
 
 class time_rules(object):
-    market_open = AfterOpen
-    market_close = BeforeClose
+    """Factories for time-based :func:`~zipline.api.schedule_function` rules.
+
+    See Also
+    --------
+    :func:`~zipline.api.schedule_function`
+    """
+
+    @staticmethod
+    def market_open(offset=None, hours=None, minutes=None):
+        """
+        Create a rule that triggers at a fixed offset from market open.
+
+        The offset can be specified either as a :class:`datetime.timedelta`, or
+        as a number of hours and minutes.
+
+        Parameters
+        ----------
+        offset : datetime.timedelta, optional
+            If passed, the offset from market open at which to trigger. Must be
+            at least 1 minute.
+        hours : int, optional
+            If passed, number of hours to wait after market open.
+        minutes : int, optional
+            If passed, number of minutes to wait after market open.
+
+        Returns
+        -------
+        rule : zipline.utils.events.EventRule
+
+        Notes
+        -----
+        If no arguments are passed, the default offset is one minute after
+        market open.
+
+        If ``offset`` is passed, ``hours`` and ``minutes`` must not be
+        passed. Conversely, if either ``hours`` or ``minutes`` are passed,
+        ``offset`` must not be passed.
+        """
+        return AfterOpen(offset=offset, hours=hours, minutes=minutes)
+
+    @staticmethod
+    def market_close(offset=None, hours=None, minutes=None):
+        """
+        Create a rule that triggers at a fixed offset from market close.
+
+        The offset can be specified either as a :class:`datetime.timedelta`, or
+        as a number of hours and minutes.
+
+        Parameters
+        ----------
+        offset : datetime.timedelta, optional
+            If passed, the offset from market close at which to trigger. Must
+            be at least 1 minute.
+        hours : int, optional
+            If passed, number of hours to wait before market close.
+        minutes : int, optional
+            If passed, number of minutes to wait before market close.
+
+        Returns
+        -------
+        rule : zipline.utils.events.EventRule
+
+        Notes
+        -----
+        If no arguments are passed, the default offset is one minute before
+        market close.
+
+        If ``offset`` is passed, ``hours`` and ``minutes`` must not be
+        passed. Conversely, if either ``hours`` or ``minutes`` are passed,
+        ``offset`` must not be passed.
+        """
+        return BeforeClose(offset=offset, hours=hours, minutes=minutes)
+
     every_minute = Always
 
 
@@ -610,20 +775,43 @@ class calendars(object):
     US_FUTURES = sentinel('US_FUTURES')
 
 
+def _invert(d):
+    return dict(zip(d.values(), d.keys()))
+
+
+_uncalled_rules = _invert(vars(date_rules))
+_uncalled_rules.update(_invert(vars(time_rules)))
+
+
+def _check_if_not_called(v):
+    try:
+        name = _uncalled_rules[v]
+    except KeyError:
+        if not issubclass(v, EventRule):
+            return
+
+        name = getattr(v, '__name__', None)
+
+    msg = 'invalid rule: %r' % (v,)
+    if name is not None:
+        msg += ' (hint: did you mean %s())' % name
+
+    raise TypeError(msg)
+
+
 def make_eventrule(date_rule, time_rule, cal, half_days=True):
     """
     Constructs an event rule from the factory api.
     """
-
-    # Insert the calendar in to the individual rules
-    date_rule.cal = cal
-    time_rule.cal = cal
+    _check_if_not_called(date_rule)
+    _check_if_not_called(time_rule)
 
     if half_days:
         inner_rule = date_rule & time_rule
     else:
-        nhd_rule = NotHalfDay()
-        nhd_rule.cal = cal
-        inner_rule = date_rule & time_rule & nhd_rule
+        inner_rule = date_rule & time_rule & NotHalfDay()
 
-    return OncePerDay(rule=inner_rule)
+    opd = OncePerDay(rule=inner_rule)
+    # This is where a scheduled function's rule is associated with a calendar.
+    opd.cal = cal
+    return opd

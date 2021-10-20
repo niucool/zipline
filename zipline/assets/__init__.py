@@ -18,25 +18,27 @@ from ._assets import (
     Equity,
     Future,
     make_asset_array,
-    CACHE_FILE_TEMPLATE
 )
 from .assets import (
     AssetFinder,
     AssetConvertible,
+    ContinuousFuture,
     PricingDataAssociable,
 )
 from .asset_db_schema import ASSET_DB_VERSION
 from .asset_writer import AssetDBWriter
+from .exchange_info import ExchangeInfo
 
 __all__ = [
     'ASSET_DB_VERSION',
     'Asset',
     'AssetDBWriter',
+    'ContinuousFuture',
     'Equity',
     'Future',
     'AssetFinder',
     'AssetConvertible',
+    'ExchangeInfo',
     'PricingDataAssociable',
     'make_asset_array',
-    'CACHE_FILE_TEMPLATE'
 ]

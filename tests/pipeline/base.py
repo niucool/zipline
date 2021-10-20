@@ -1,20 +1,19 @@
 """
 Base class for Pipeline API unit tests.
 """
-from functools import wraps
-
 import numpy as np
 from numpy import arange, prod
 from pandas import DataFrame, Timestamp
 from six import iteritems
 
-from zipline.pipeline.engine import SimplePipelineEngine
+from zipline.lib.labelarray import LabelArray
+from zipline.utils.compat import wraps
 from zipline.pipeline import ExecutionPlan
+from zipline.pipeline.domain import US_EQUITIES
+from zipline.pipeline.engine import SimplePipelineEngine
+from zipline.pipeline.hooks import NoHooks
 from zipline.pipeline.term import AssetExists, InputDates
-from zipline.testing import (
-    check_arrays,
-    ExplodingObject,
-)
+from zipline.testing import check_arrays
 from zipline.testing.fixtures import (
     WithAssetFinder,
     WithTradingSessions,
@@ -52,20 +51,21 @@ def with_defaults(**default_funcs):
 with_default_shape = with_defaults(shape=lambda self: self.default_shape)
 
 
-class BasePipelineTestCase(WithTradingSessions,
-                           WithAssetFinder,
-                           ZiplineTestCase):
+class BaseUSEquityPipelineTestCase(WithTradingSessions,
+                                   WithAssetFinder,
+                                   ZiplineTestCase):
     START_DATE = Timestamp('2014', tz='UTC')
     END_DATE = Timestamp('2014-12-31', tz='UTC')
     ASSET_FINDER_EQUITY_SIDS = list(range(20))
 
     @classmethod
     def init_class_fixtures(cls):
-        super(BasePipelineTestCase, cls).init_class_fixtures()
+        super(BaseUSEquityPipelineTestCase, cls).init_class_fixtures()
 
         cls.default_asset_exists_mask = cls.asset_finder.lifetimes(
             cls.nyse_sessions[-30:],
             include_start_date=False,
+            country_codes={cls.ASSET_FINDER_COUNTRY_CODE},
         )
 
     @property
@@ -80,7 +80,7 @@ class BasePipelineTestCase(WithTradingSessions,
 
         Parameters
         ----------
-        graph : zipline.pipeline.graph.TermGraph
+        graph : zipline.pipeline.graph.ExecutionPlan
             Graph to run.
         initial_workspace : dict
             Initial workspace to forward to SimplePipelineEngine.compute_chunk.
@@ -94,25 +94,45 @@ class BasePipelineTestCase(WithTradingSessions,
         results : dict
             Mapping from termname -> computed result.
         """
+        def get_loader(c):
+            raise AssertionError("run_graph() should not require any loaders!")
+
         engine = SimplePipelineEngine(
-            lambda column: ExplodingObject(),
-            self.nyse_sessions,
+            get_loader,
             self.asset_finder,
+            default_domain=US_EQUITIES,
         )
         if mask is None:
             mask = self.default_asset_exists_mask
 
-        dates, assets, mask_values = explode(mask)
+        dates, sids, mask_values = explode(mask)
 
         initial_workspace.setdefault(AssetExists(), mask_values)
         initial_workspace.setdefault(InputDates(), dates)
 
+        refcounts = graph.initial_refcounts(initial_workspace)
+        execution_order = graph.execution_order(initial_workspace, refcounts)
+
         return engine.compute_chunk(
-            graph,
-            dates,
-            assets,
-            initial_workspace,
+            graph=graph,
+            dates=dates,
+            sids=sids,
+            workspace=initial_workspace,
+            execution_order=execution_order,
+            refcounts=refcounts,
+            hooks=NoHooks(),
         )
+
+    def run_terms(self, terms, initial_workspace, mask):
+        start_date, end_date = mask.index[[0, -1]]
+        graph = ExecutionPlan(
+            domain=US_EQUITIES,
+            terms=terms,
+            start_date=start_date,
+            end_date=end_date,
+        )
+
+        return self.run_graph(graph, initial_workspace, mask)
 
     def check_terms(self,
                     terms,
@@ -124,15 +144,8 @@ class BasePipelineTestCase(WithTradingSessions,
         Compile the given terms into a TermGraph, compute it with
         initial_workspace, and compare the results with ``expected``.
         """
-        start_date, end_date = mask.index[[0, -1]]
-        graph = ExecutionPlan(
-            terms,
-            all_dates=self.nyse_sessions,
-            start_date=start_date,
-            end_date=end_date,
-        )
+        results = self.run_terms(terms, initial_workspace, mask)
 
-        results = self.run_graph(graph, initial_workspace, mask)
         for key, (res, exp) in dzip_exact(results, expected).items():
             check(res, exp)
 
@@ -163,9 +176,42 @@ class BasePipelineTestCase(WithTradingSessions,
     @with_default_shape
     def randn_data(self, seed, shape):
         """
-        Build a block of testing data from a seeded RandomState.
+        Build a block of random numerical data.
         """
         return np.random.RandomState(seed).randn(*shape)
+
+    @with_default_shape
+    def rand_ints(self, seed, shape, low=0, high=10):
+        """
+        Build a block of random numerical data.
+        """
+        rand = np.random.RandomState(seed)
+        return rand.randint(low, high, shape, dtype='i8')
+
+    @with_default_shape
+    def rand_datetimes(self, seed, shape):
+        ints = self.rand_ints(seed=seed, shape=shape, low=0, high=10000)
+        return ints.astype('datetime64[D]').astype('datetime64[ns]')
+
+    @with_default_shape
+    def rand_categoricals(self, categories, seed, shape, missing_value=None):
+        """Build a block of random categorical data.
+
+        Categories should not include ``missing_value``.
+        """
+        categories = list(categories) + [missing_value]
+        data = np.random.RandomState(seed).choice(categories, shape)
+        return LabelArray(
+            data,
+            missing_value=missing_value,
+            categories=categories,
+        )
+
+    @with_default_shape
+    def rand_mask(self, seed, shape):
+        """Build a block of random boolean data.
+        """
+        return np.random.RandomState(seed).randint(0, 2, shape).astype(bool)
 
     @with_default_shape
     def eye_mask(self, shape):

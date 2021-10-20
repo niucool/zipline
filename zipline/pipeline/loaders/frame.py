@@ -3,6 +3,7 @@ PipelineLoader accepting a DataFrame as input.
 """
 from functools import partial
 
+from interface import implements
 from numpy import (
     ix_,
     zeros,
@@ -28,7 +29,7 @@ ADJUSTMENT_COLUMNS = Index([
 ])
 
 
-class DataFrameLoader(PipelineLoader):
+class DataFrameLoader(implements(PipelineLoader)):
     """
     A PipelineLoader that reads its input from DataFrames.
 
@@ -71,7 +72,7 @@ class DataFrameLoader(PipelineLoader):
             )
         else:
             # Ensure that columns are in the correct order.
-            adjustments = adjustments.reindex_axis(ADJUSTMENT_COLUMNS, axis=1)
+            adjustments = adjustments.reindex(ADJUSTMENT_COLUMNS, axis=1)
             adjustments.sort_values(['apply_date', 'sid'], inplace=True)
 
         self.adjustments = adjustments
@@ -145,32 +146,42 @@ class DataFrameLoader(PipelineLoader):
             )
         return out
 
-    def load_adjusted_array(self, columns, dates, assets, mask):
+    def load_adjusted_array(self, domain, columns, dates, sids, mask):
         """
         Load data from our stored baseline.
         """
-        column = self.column
         if len(columns) != 1:
             raise ValueError(
                 "Can't load multiple columns with DataFrameLoader"
             )
-        elif columns[0] != column:
-            raise ValueError("Can't load unknown column %s" % columns[0])
+
+        column = columns[0]
+        self._validate_input_column(column)
 
         date_indexer = self.dates.get_indexer(dates)
-        assets_indexer = self.assets.get_indexer(assets)
+        assets_indexer = self.assets.get_indexer(sids)
 
         # Boolean arrays with True on matched entries
         good_dates = (date_indexer != -1)
         good_assets = (assets_indexer != -1)
 
+        data = self.baseline[ix_(date_indexer, assets_indexer)]
+        mask = (good_assets & as_column(good_dates)) & mask
+
+        # Mask out requested columns/rows that didn't match.
+        data[~mask] = column.missing_value
+
         return {
             column: AdjustedArray(
                 # Pull out requested columns/rows from our baseline data.
-                data=self.baseline[ix_(date_indexer, assets_indexer)],
-                # Mask out requested columns/rows that didnt match.
-                mask=(good_assets & as_column(good_dates)) & mask,
-                adjustments=self.format_adjustments(dates, assets),
+                data=data,
+                adjustments=self.format_adjustments(dates, sids),
                 missing_value=column.missing_value,
             ),
         }
+
+    def _validate_input_column(self, column):
+        """Make sure a passed column is our column.
+        """
+        if column != self.column and column.unspecialize() != self.column:
+            raise ValueError("Can't load unknown column %s" % column)

@@ -1,6 +1,7 @@
 """
 classifier.py
 """
+from functools import partial
 from numbers import Number
 import operator
 import re
@@ -8,25 +9,28 @@ import re
 from numpy import where, isnan, nan, zeros
 import pandas as pd
 
+from zipline.errors import UnsupportedDataType
 from zipline.lib.labelarray import LabelArray
 from zipline.lib.quantiles import quantiles
 from zipline.pipeline.api_utils import restrict_to_dtype
+from zipline.pipeline.dtypes import (
+    CLASSIFIER_DTYPES,
+    FACTOR_DTYPES,
+    FILTER_DTYPES,
+)
 from zipline.pipeline.sentinels import NotSpecified
 from zipline.pipeline.term import ComputableTerm
 from zipline.utils.compat import unicode
-from zipline.utils.input_validation import expect_types
-from zipline.utils.memoize import classlazyval
+from zipline.utils.input_validation import expect_types, expect_dtypes
 from zipline.utils.numpy_utils import (
     categorical_dtype,
     int64_dtype,
     vectorized_is_element,
 )
 
-from ..filters import ArrayPredicate, NotNullFilter, NullFilter, NumExprFilter
+from ..filters import ArrayPredicate, NumExprFilter
 from ..mixins import (
-    AliasedMixin,
     CustomTermMixin,
-    DownsampledMixin,
     LatestMixin,
     PositiveWindowLengthMixin,
     RestrictedDTypeMixin,
@@ -39,7 +43,7 @@ string_classifiers_only = restrict_to_dtype(
     dtype=categorical_dtype,
     message_template=(
         "{method_name}() is only defined on Classifiers producing strings"
-        " but it was called on a Factor of dtype {received_dtype}."
+        " but it was called on a Classifier of dtype {received_dtype}."
     )
 )
 
@@ -55,20 +59,8 @@ class Classifier(RestrictedDTypeMixin, ComputableTerm):
     which the classifier produced the same label.
     """
     # Used by RestrictedDTypeMixin
-    ALLOWED_DTYPES = (int64_dtype, categorical_dtype)
+    ALLOWED_DTYPES = CLASSIFIER_DTYPES
     categories = NotSpecified
-
-    def isnull(self):
-        """
-        A Filter producing True for values where this term has missing data.
-        """
-        return NullFilter(self)
-
-    def notnull(self):
-        """
-        A Filter producing True for values where this term has complete data.
-        """
-        return NotNullFilter(self)
 
     # We explicitly don't support classifier to classifier comparisons, since
     # the stored values likely don't mean the same thing. This may be relaxed
@@ -127,6 +119,16 @@ class Classifier(RestrictedDTypeMixin, ComputableTerm):
         else:
             # Numexpr doesn't know how to use LabelArrays.
             return ArrayPredicate(term=self, op=operator.ne, opargs=(other,))
+
+    def bad_compare(opname, other):
+        raise TypeError('cannot compare classifiers with %s' % opname)
+
+    __gt__ = partial(bad_compare, '>')
+    __ge__ = partial(bad_compare, '>=')
+    __le__ = partial(bad_compare, '<=')
+    __lt__ = partial(bad_compare, '<')
+
+    del bad_compare
 
     @string_classifiers_only
     @expect_types(prefix=(bytes, unicode))
@@ -223,6 +225,26 @@ class Classifier(RestrictedDTypeMixin, ComputableTerm):
             op=LabelArray.matches,
             opargs=(pattern,),
         )
+
+    # TODO: Support relabeling for integer dtypes.
+    @string_classifiers_only
+    def relabel(self, relabeler):
+        """
+        Convert ``self`` into a new classifier by mapping a function over each
+        element produced by ``self``.
+
+        Parameters
+        ----------
+        relabeler : function[str -> str or None]
+            A function to apply to each unique value produced by ``self``.
+
+        Returns
+        -------
+        relabeled : Classifier
+            A classifier produced by applying ``relabeler`` to each unique
+            value produced by ``self``.
+        """
+        return Relabel(term=self, relabeler=relabeler)
 
     def element_of(self, choices):
         """
@@ -333,13 +355,72 @@ class Classifier(RestrictedDTypeMixin, ComputableTerm):
             self.missing_value,
         )
 
-    @classlazyval
-    def _downsampled_type(self):
-        return DownsampledMixin.make_downsampled_type(Classifier)
+    @classmethod
+    def _principal_computable_term_type(cls):
+        return Classifier
 
-    @classlazyval
-    def _aliased_type(self):
-        return AliasedMixin.make_aliased_type(Classifier)
+    def _to_integral(self, output_array):
+        """
+        Convert an array produced by this classifier into an array of integer
+        labels and a missing value label.
+        """
+        if self.dtype == int64_dtype:
+            group_labels = output_array
+            null_label = self.missing_value
+        elif self.dtype == categorical_dtype:
+            # Coerce LabelArray into an isomorphic array of ints.  This is
+            # necessary because np.where doesn't know about LabelArrays or the
+            # void dtype.
+            group_labels = output_array.as_int_array()
+            null_label = output_array.missing_value_code
+        else:
+            raise AssertionError(
+                "Unexpected Classifier dtype: %s." % self.dtype
+            )
+        return group_labels, null_label
+
+    def peer_count(self, mask=NotSpecified):
+        """
+        Construct a factor that gives the number of occurrences of
+        each distinct category in a classifier.
+
+        Parameters
+        ----------
+        mask : zipline.pipeline.Filter, optional
+            If passed, only count assets passing the filter.  Default behavior
+            is to count all assets.
+
+        Examples
+        --------
+        Let ``c`` be a Classifier which would produce the following output::
+
+                         AAPL   MSFT    MCD     BK   AMZN     FB
+            2015-05-05    'a'    'a'   None    'b'    'a'   None
+            2015-05-06    'b'    'a'    'c'    'b'    'b'    'b'
+            2015-05-07   None    'a'   'aa'   'aa'   'aa'   None
+            2015-05-08    'c'    'c'    'c'    'c'    'c'    'c'
+
+        Then ``c.peer_count()`` will count, for each row, the total number
+        of assets in each classifier category produced by ``c``.  Missing
+        data will be evaluated to NaN.
+
+        ::
+
+                         AAPL   MSFT    MCD     BK   AMZN     FB
+            2015-05-05    3.0    3.0    NaN    1.0    3.0    NaN
+            2015-05-06    4.0    1.0    1.0    4.0    4.0    4.0
+            2015-05-07    NaN    1.0    3.0    3.0    3.0    NaN
+            2015-05-08    6.0    6.0    6.0    6.0    6.0    6.0
+
+        Returns
+        -------
+        factor : CustomFactor
+            A CustomFactor that counts, for each asset, the total number
+            of assets with the same classifier category label.
+        """
+        # Lazy import due to cyclic dependencies in factor.py, classifier.py
+        from ..factors import PeerCount
+        return PeerCount(inputs=[self], mask=mask)
 
 
 class Everything(Classifier):
@@ -378,8 +459,51 @@ class Quantiles(SingleInputMixin, Classifier):
         result[isnan(result)] = self.missing_value
         return result.astype(int64_dtype)
 
-    def short_repr(self):
+    def graph_repr(self):
+        """Short repr to use when rendering Pipeline graphs."""
         return type(self).__name__ + '(%d)' % self.params['bins']
+
+
+class Relabel(SingleInputMixin, Classifier):
+    """
+    A classifier applying a relabeling function on the result of another
+    classifier.
+
+    Parameters
+    ----------
+    arg : zipline.pipeline.Classifier
+        Term produceing the input to be relabeled.
+    relabel_func : function(LabelArray) -> LabelArray
+        Function to apply to the result of `term`.
+    """
+    window_length = 0
+    params = ('relabeler',)
+
+    # TODO: Support relabeling for integer dtypes.
+    @expect_dtypes(term=categorical_dtype)
+    @expect_types(term=Classifier)
+    def __new__(cls, term, relabeler):
+        return super(Relabel, cls).__new__(
+            cls,
+            inputs=(term,),
+            dtype=term.dtype,
+            mask=term.mask,
+            relabeler=relabeler,
+        )
+
+    def _compute(self, arrays, dates, assets, mask):
+        relabeler = self.params['relabeler']
+        data = arrays[0]
+
+        if isinstance(data, LabelArray):
+            result = data.map(relabeler)
+            result[~mask] = data.missing_value
+        else:
+            raise NotImplementedError(
+                "Relabeling is not currently supported for "
+                "int-dtype classifiers."
+            )
+        return result
 
 
 class CustomClassifier(PositiveWindowLengthMixin,
@@ -396,6 +520,24 @@ class CustomClassifier(PositiveWindowLengthMixin,
     zipline.pipeline.CustomFactor
     zipline.pipeline.CustomFilter
     """
+    def _validate(self):
+        try:
+            super(CustomClassifier, self)._validate()
+        except UnsupportedDataType:
+            if self.dtype in FACTOR_DTYPES:
+                raise UnsupportedDataType(
+                    typename=type(self).__name__,
+                    dtype=self.dtype,
+                    hint='Did you mean to create a CustomFactor?',
+                )
+            elif self.dtype in FILTER_DTYPES:
+                raise UnsupportedDataType(
+                    typename=type(self).__name__,
+                    dtype=self.dtype,
+                    hint='Did you mean to create a CustomFilter?',
+                )
+            raise
+
     def _allocate_output(self, windows, shape):
         """
         Override the default array allocation to produce a LabelArray when we
@@ -420,8 +562,6 @@ class Latest(LatestMixin, CustomClassifier):
     See Also
     --------
     zipline.pipeline.data.dataset.BoundColumn.latest
-    zipline.pipeline.factors.factor.Latest
-    zipline.pipeline.filters.filter.Latest
     """
     pass
 

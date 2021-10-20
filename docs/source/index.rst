@@ -1,11 +1,17 @@
-.. include:: ../../README.rst
+.. title:: Zipline Trader
+
+.. include:: abstract.rst
 
 .. toctree::
    :maxdepth: 1
 
    install
-   beginner-tutorial
-   bundles
-   releases
-   appendix
-   release-process
+   configuration-file
+   alpaca-bundle-ingestion
+   research
+   backtest
+   going-live
+   database-backend
+   troubleshoot
+   zipline-docs
+

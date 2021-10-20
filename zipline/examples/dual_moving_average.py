@@ -23,11 +23,19 @@ momentum).
 """
 
 from zipline.api import order_target, record, symbol
+from zipline.finance import commission, slippage
 
 
 def initialize(context):
     context.sym = symbol('AAPL')
     context.i = 0
+
+    # Explicitly set the commission/slippage to the "old" value until we can
+    # rebuild example data.
+    # github.com/quantopian/zipline/blob/master/tests/resources/
+    # rebuild_example_data#L105
+    context.set_commission(commission.PerShare(cost=.0075, min_trade_cost=1.0))
+    context.set_slippage(slippage.VolumeShareSlippage())
 
 
 def handle_data(context, data):
@@ -79,14 +87,14 @@ def analyze(context=None, results=None):
         results['AAPL'].plot(ax=ax2)
         results[['short_mavg', 'long_mavg']].plot(ax=ax2)
 
-        trans = results.ix[[t != [] for t in results.transactions]]
-        buys = trans.ix[[t[0]['amount'] > 0 for t in
+        trans = results.loc[[t != [] for t in results.transactions]]
+        buys = trans.loc[[t[0]['amount'] > 0 for t in
                          trans.transactions]]
-        sells = trans.ix[
+        sells = trans.loc[
             [t[0]['amount'] < 0 for t in trans.transactions]]
-        ax2.plot(buys.index, results.short_mavg.ix[buys.index],
+        ax2.plot(buys.index, results.short_mavg.loc[buys.index],
                  '^', markersize=10, color='m')
-        ax2.plot(sells.index, results.short_mavg.ix[sells.index],
+        ax2.plot(sells.index, results.short_mavg.loc[sells.index],
                  'v', markersize=10, color='k')
         plt.legend(loc=0)
     else:

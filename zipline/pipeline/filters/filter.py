@@ -5,9 +5,11 @@ from itertools import chain
 from operator import attrgetter
 
 from numpy import (
+    any as np_any,
     float64,
     nan,
     nanpercentile,
+    uint8,
 )
 
 from zipline.errors import (
@@ -16,7 +18,12 @@ from zipline.errors import (
     UnsupportedDataType,
 )
 from zipline.lib.labelarray import LabelArray
-from zipline.lib.rank import is_missing
+from zipline.lib.rank import is_missing, grouped_masked_is_maximal
+from zipline.pipeline.dtypes import (
+    CLASSIFIER_DTYPES,
+    FACTOR_DTYPES,
+    FILTER_DTYPES,
+)
 from zipline.pipeline.expression import (
     BadBinaryOperator,
     FILTER_BINOPS,
@@ -24,18 +31,24 @@ from zipline.pipeline.expression import (
     NumericalExpression,
 )
 from zipline.pipeline.mixins import (
-    AliasedMixin,
     CustomTermMixin,
-    DownsampledMixin,
+    IfElseMixin,
     LatestMixin,
     PositiveWindowLengthMixin,
     RestrictedDTypeMixin,
     SingleInputMixin,
+    StandardOutputs,
 )
 from zipline.pipeline.term import ComputableTerm, Term
 from zipline.utils.input_validation import expect_types
-from zipline.utils.memoize import classlazyval
-from zipline.utils.numpy_utils import bool_dtype, repeat_first_axis
+from zipline.utils.numpy_utils import (
+    same,
+    bool_dtype,
+    int64_dtype,
+    repeat_first_axis,
+)
+
+from ..sentinels import NotSpecified
 
 
 def concat_tuples(*tuples):
@@ -174,7 +187,8 @@ class Filter(RestrictedDTypeMixin, ComputableTerm):
     # same thing from all temporal perspectives.
     window_safe = True
 
-    ALLOWED_DTYPES = (bool_dtype,)  # Used by RestrictedDTypeMixin
+    # Used by RestrictedDTypeMixin
+    ALLOWED_DTYPES = FILTER_DTYPES
     dtype = bool_dtype
 
     clsdict = locals()
@@ -204,13 +218,105 @@ class Filter(RestrictedDTypeMixin, ComputableTerm):
             )
         return retval
 
-    @classlazyval
-    def _downsampled_type(self):
-        return DownsampledMixin.make_downsampled_type(Filter)
+    @classmethod
+    def _principal_computable_term_type(cls):
+        return Filter
 
-    @classlazyval
-    def _aliased_type(self):
-        return AliasedMixin.make_aliased_type(Filter)
+    @expect_types(if_true=ComputableTerm, if_false=ComputableTerm)
+    def if_else(self, if_true, if_false):
+        """
+        Create a term that selects values from one of two choices.
+
+        Parameters
+        ----------
+        if_true : zipline.pipeline.term.ComputableTerm
+            Expression whose values should be used at locations where this
+            filter outputs True.
+        if_false : zipline.pipeline.term.ComputableTerm
+            Expression whose values should be used at locations where this
+            filter outputs False.
+
+        Returns
+        -------
+        merged : zipline.pipeline.term.ComputableTerm
+           A term that computes by taking values from either ``if_true`` or
+           ``if_false``, depending on the values produced by ``self``.
+
+           The returned term draws from``if_true`` at locations where ``self``
+           produces True, and it draws from ``if_false`` at locations where
+           ``self`` produces False.
+
+        Example
+        -------
+
+        Let ``f`` be a Factor that produces the following output::
+
+                         AAPL   MSFT    MCD     BK
+            2017-03-13    1.0    2.0    3.0    4.0
+            2017-03-14    5.0    6.0    7.0    8.0
+
+        Let ``g`` be another Factor that produces the following output::
+
+                         AAPL   MSFT    MCD     BK
+            2017-03-13   10.0   20.0   30.0   40.0
+            2017-03-14   50.0   60.0   70.0   80.0
+
+        Finally, let ``condition`` be a Filter that produces the following
+        output::
+
+                         AAPL   MSFT    MCD     BK
+            2017-03-13   True  False   True  False
+            2017-03-14   True   True  False  False
+
+        Then, the expression ``condition.if_else(f, g)`` produces the following
+        output::
+
+                         AAPL   MSFT    MCD     BK
+            2017-03-13    1.0   20.0    3.0   40.0
+            2017-03-14    5.0    6.0   70.0   80.0
+
+        See Also
+        --------
+        numpy.where
+        Factor.fillna
+        """
+        true_type = if_true._principal_computable_term_type()
+        false_type = if_false._principal_computable_term_type()
+
+        if true_type is not false_type:
+            raise TypeError(
+                "Mismatched types in if_else(): if_true={}, but if_false={}"
+                .format(true_type.__name__, false_type.__name__)
+            )
+
+        if if_true.dtype != if_false.dtype:
+            raise TypeError(
+                "Mismatched dtypes in if_else(): "
+                "if_true.dtype = {}, if_false.dtype = {}"
+                .format(if_true.dtype, if_false.dtype)
+            )
+
+        if if_true.outputs != if_false.outputs:
+            raise ValueError(
+                "Mismatched outputs in if_else(): "
+                "if_true.outputs = {}, if_false.outputs = {}"
+                .format(if_true.outputs, if_false.outputs),
+            )
+
+        if not same(if_true.missing_value, if_false.missing_value):
+            raise ValueError(
+                "Mismatched missing values in if_else(): "
+                "if_true.missing_value = {!r}, if_false.missing_value = {!r}"
+                .format(if_true.missing_value, if_false.missing_value)
+            )
+
+        return_type = type(if_true)._with_mixin(IfElseMixin)
+
+        return return_type(
+            condition=self,
+            if_true=if_true,
+            if_false=if_false,
+        )
 
 
 class NumExprFilter(NumericalExpression, Filter):
@@ -366,6 +472,14 @@ class PercentileFilter(SingleInputMixin, Filter):
         )
         return (lower_bounds <= data) & (data <= upper_bounds)
 
+    def graph_repr(self):
+        # Graphviz interprets `\l` as "divide label into lines, left-justified"
+        return "{}:\\l  min: {}, max: {}\\l".format(
+            type(self).__name__,
+            self._min_percentile,
+            self._max_percentile,
+        )
+
 
 class CustomFilter(PositiveWindowLengthMixin, CustomTermMixin, Filter):
     """
@@ -375,9 +489,9 @@ class CustomFilter(PositiveWindowLengthMixin, CustomTermMixin, Filter):
     ----------
     inputs : iterable, optional
         An iterable of `BoundColumn` instances (e.g. USEquityPricing.close),
-        describing the data to load and pass to `self.compute`.  If this
+        describing the data to load and pass to ``self.compute``.  If this
         argument is passed to the CustomFilter constructor, we look for a
-        class-level attribute named `inputs`.
+        class-level attribute named ``inputs``.
     window_length : int, optional
         Number of rows to pass for each input.  If this argument is not passed
         to the CustomFilter constructor, we look for a class-level attribute
@@ -386,7 +500,7 @@ class CustomFilter(PositiveWindowLengthMixin, CustomTermMixin, Filter):
     Notes
     -----
     Users implementing their own Filters should subclass CustomFilter and
-    implement a method named `compute` with the following signature:
+    implement a method named ``compute`` with the following signature:
 
     .. code-block:: python
 
@@ -397,7 +511,7 @@ class CustomFilter(PositiveWindowLengthMixin, CustomTermMixin, Filter):
     an array of sids, an output array, and an input array for each expression
     passed as inputs to the CustomFilter constructor.
 
-    The specific types of the values passed to `compute` are as follows::
+    The specific types of the values passed to ``compute`` are as follows::
 
         today : np.datetime64[ns]
             Row label for the last row of all arrays passed as `inputs`.
@@ -410,13 +524,30 @@ class CustomFilter(PositiveWindowLengthMixin, CustomTermMixin, Filter):
             Raw data arrays corresponding to the values of `self.inputs`.
 
     See the documentation for
-    :class:`~zipline.pipeline.factors.factor.CustomFactor` for more details on
+    :class:`~zipline.pipeline.CustomFactor` for more details on
     implementing a custom ``compute`` method.
 
     See Also
     --------
-    zipline.pipeline.factors.factor.CustomFactor
+    zipline.pipeline.CustomFactor
     """
+    def _validate(self):
+        try:
+            super(CustomFilter, self)._validate()
+        except UnsupportedDataType:
+            if self.dtype in CLASSIFIER_DTYPES:
+                raise UnsupportedDataType(
+                    typename=type(self).__name__,
+                    dtype=self.dtype,
+                    hint='Did you mean to create a CustomClassifier?',
+                )
+            elif self.dtype in FACTOR_DTYPES:
+                raise UnsupportedDataType(
+                    typename=type(self).__name__,
+                    dtype=self.dtype,
+                    hint='Did you mean to create a CustomFactor?',
+                )
+            raise
 
 
 class ArrayPredicate(SingleInputMixin, Filter):
@@ -432,6 +563,7 @@ class ArrayPredicate(SingleInputMixin, Filter):
     opargs : tuple[hashable]
         Additional argument to apply to ``op``.
     """
+    params = ('op', 'opargs')
     window_length = 0
 
     @expect_types(term=Term, opargs=tuple)
@@ -445,22 +577,18 @@ class ArrayPredicate(SingleInputMixin, Filter):
             mask=term.mask,
         )
 
-    def _init(self, op, opargs, *args, **kwargs):
-        self._op = op
-        self._opargs = opargs
-        return super(ArrayPredicate, self)._init(*args, **kwargs)
-
-    @classmethod
-    def _static_identity(cls, op, opargs, *args, **kwargs):
-        return (
-            super(ArrayPredicate, cls)._static_identity(*args, **kwargs),
-            op,
-            opargs,
-        )
-
     def _compute(self, arrays, dates, assets, mask):
+        params = self.params
         data = arrays[0]
-        return self._op(data, *self._opargs) & mask
+        return params['op'](data, *params['opargs']) & mask
+
+    def graph_repr(self):
+        # Graphviz interprets `\l` as "divide label into lines, left-justified"
+        return "{}:\\l  op: {}.{}()".format(
+            type(self).__name__,
+            self.params['op'].__module__,
+            self.params['op'].__name__,
+        )
 
 
 class Latest(LatestMixin, CustomFilter):
@@ -500,6 +628,10 @@ class SingleAsset(Filter):
                 asset=self._asset, start_date=dates[0], end_date=dates[-1],
             )
         return out
+
+    def graph_repr(self):
+        # Graphviz interprets `\l` as "divide label into lines, left-justified"
+        return "SingleAsset:\\l  asset: {!r}\\l".format(self._asset)
 
 
 class StaticSids(Filter):
@@ -544,3 +676,77 @@ class StaticAssets(StaticSids):
     def __new__(cls, assets):
         sids = frozenset(asset.sid for asset in assets)
         return super(StaticAssets, cls).__new__(cls, sids)
+
+
+class AllPresent(CustomFilter, SingleInputMixin, StandardOutputs):
+    """Pipeline filter indicating input term has data for a given window.
+    """
+    def _validate(self):
+
+        if isinstance(self.inputs[0], Filter):
+            raise TypeError(
+                "Input to filter `AllPresent` cannot be a Filter."
+            )
+
+        return super(AllPresent, self)._validate()
+
+    def compute(self, today, assets, out, value):
+        if isinstance(value, LabelArray):
+            out[:] = ~np_any(value.is_missing(), axis=0)
+        else:
+            out[:] = ~np_any(
+                is_missing(value, self.inputs[0].missing_value),
+                axis=0,
+            )
+
+
+class MaximumFilter(Filter, StandardOutputs):
+    """Pipeline filter that selects the top asset, possibly grouped and masked.
+    """
+    window_length = 0
+
+    def __new__(cls, factor, groupby, mask):
+        if groupby is NotSpecified:
+            from zipline.pipeline.classifiers import Everything
+            groupby = Everything()
+
+        return super(MaximumFilter, cls).__new__(
+            cls,
+            inputs=(factor, groupby),
+            mask=mask,
+        )
+
+    def _compute(self, arrays, dates, assets, mask):
+        # XXX: We're doing a lot of unncessary work here if `groupby` isn't
+        # specified.
+        data = arrays[0]
+        group_labels, null_label = self.inputs[1]._to_integral(arrays[1])
+        effective_mask = (
+            mask
+            & (group_labels != null_label)
+            & ~is_missing(data, self.inputs[0].missing_value)
+        ).view(uint8)
+
+        return grouped_masked_is_maximal(
+            # Unconditionally view the data as int64.
+            # This is safe because casting from float64 to int64 is an
+            # order-preserving operation.
+            data.view(int64_dtype),
+            # PERF: Consider supporting different sizes of group labels.
+            group_labels.astype(int64_dtype),
+            effective_mask,
+        )
+
+    def __repr__(self):
+        return "Maximum({}, groupby={}, mask={})".format(
+            self.inputs[0].recursive_repr(),
+            self.inputs[1].recursive_repr(),
+            self.mask.recursive_repr(),
+        )
+
+    def graph_repr(self):
+        # Graphviz interprets `\l` as "divide label into lines, left-justified"
+        return "Maximum:\\l  groupby: {}\\l  mask: {}\\l".format(
+            self.inputs[1].recursive_repr(),
+            self.mask.recursive_repr(),
+        )

@@ -11,131 +11,206 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from numpy import (
-    iinfo,
-    uint32,
-)
+from collections import defaultdict
 
-from zipline.data.us_equity_pricing import (
-    BcolzDailyBarReader,
-    SQLiteAdjustmentReader,
-)
+from interface import implements
+from numpy import iinfo, uint32, multiply
+
+from zipline.data.fx import ExplodingFXRateReader
 from zipline.lib.adjusted_array import AdjustedArray
-from zipline.errors import NoFurtherDataError
-from zipline.utils.calendars import get_calendar
+from zipline.utils.numpy_utils import repeat_first_axis
 
 from .base import PipelineLoader
+from .utils import shift_dates
+from ..data.equity_pricing import EquityPricing
 
 UINT32_MAX = iinfo(uint32).max
 
 
-class USEquityPricingLoader(PipelineLoader):
+class EquityPricingLoader(implements(PipelineLoader)):
+    """A PipelineLoader for loading daily OHLCV data.
+
+    Parameters
+    ----------
+    raw_price_reader : zipline.data.session_bars.SessionBarReader
+        Reader providing raw prices.
+    adjustments_reader : zipline.data.adjustments.SQLiteAdjustmentReader
+        Reader providing price/volume adjustments.
+    fx_reader : zipline.data.fx.FXRateReader
+       Reader providing currency conversions.
     """
-    PipelineLoader for US Equity Pricing data
 
-    Delegates loading of baselines and adjustments.
-    """
-
-    def __init__(self, raw_price_loader, adjustments_loader):
-        self.raw_price_loader = raw_price_loader
-        self.adjustments_loader = adjustments_loader
-
-        cal = self.raw_price_loader.trading_calendar or \
-            get_calendar("NYSE")
-
-        self._all_sessions = cal.all_sessions
+    def __init__(self,
+                 raw_price_reader,
+                 adjustments_reader,
+                 fx_reader):
+        self.raw_price_reader = raw_price_reader
+        self.adjustments_reader = adjustments_reader
+        self.fx_reader = fx_reader
 
     @classmethod
-    def from_files(cls, pricing_path, adjustments_path):
+    def without_fx(cls, raw_price_reader, adjustments_reader):
         """
-        Create a loader from a bcolz equity pricing dir and a SQLite
-        adjustments path.
+        Construct an EquityPricingLoader without support for fx rates.
+
+        The returned loader will raise an error if requested to load
+        currency-converted columns.
 
         Parameters
         ----------
-        pricing_path : str
-            Path to a bcolz directory written by a BcolzDailyBarWriter.
-        adjusments_path : str
-            Path to an adjusments db written by a SQLiteAdjustmentWriter.
+        raw_price_reader : zipline.data.session_bars.SessionBarReader
+            Reader providing raw prices.
+        adjustments_reader : zipline.data.adjustments.SQLiteAdjustmentReader
+            Reader providing price/volume adjustments.
+
+        Returns
+        -------
+        loader : EquityPricingLoader
+            A loader that can only provide currency-naive data.
         """
         return cls(
-            BcolzDailyBarReader(pricing_path),
-            SQLiteAdjustmentReader(adjustments_path)
+            raw_price_reader=raw_price_reader,
+            adjustments_reader=adjustments_reader,
+            fx_reader=ExplodingFXRateReader(),
         )
 
-    def load_adjusted_array(self, columns, dates, assets, mask):
+    def load_adjusted_array(self, domain, columns, dates, sids, mask):
         # load_adjusted_array is called with dates on which the user's algo
         # will be shown data, which means we need to return the data that would
-        # be known at the start of each date.  We assume that the latest data
-        # known on day N is the data from day (N - 1), so we shift all query
-        # dates back by a day.
-        start_date, end_date = _shift_dates(
-            self._all_sessions, dates[0], dates[-1], shift=1,
+        # be known at the **start** of each date. We assume that the latest
+        # data known on day N is the data from day (N - 1), so we shift all
+        # query dates back by a trading session.
+        sessions = domain.all_sessions()
+        shifted_dates = shift_dates(sessions, dates[0], dates[-1], shift=1)
+
+        ohlcv_cols, currency_cols = self._split_column_types(columns)
+        del columns  # From here on we should use ohlcv_cols or currency_cols.
+        ohlcv_colnames = [c.name for c in ohlcv_cols]
+
+        raw_ohlcv_arrays = self.raw_price_reader.load_raw_arrays(
+            ohlcv_colnames,
+            shifted_dates[0],
+            shifted_dates[-1],
+            sids,
         )
-        colnames = [c.name for c in columns]
-        raw_arrays = self.raw_price_loader.load_raw_arrays(
-            colnames,
-            start_date,
-            end_date,
-            assets,
+
+        # Currency convert raw_arrays in place if necessary. We use shifted
+        # dates to load currency conversion rates to make them line up with
+        # dates used to fetch prices.
+        self._inplace_currency_convert(
+            ohlcv_cols,
+            raw_ohlcv_arrays,
+            shifted_dates,
+            sids,
         )
-        adjustments = self.adjustments_loader.load_adjustments(
-            colnames,
+
+        adjustments = self.adjustments_reader.load_pricing_adjustments(
+            ohlcv_colnames,
             dates,
-            assets,
+            sids,
         )
 
         out = {}
-        for c, c_raw, c_adjs in zip(columns, raw_arrays, adjustments):
+        for c, c_raw, c_adjs in zip(ohlcv_cols, raw_ohlcv_arrays, adjustments):
             out[c] = AdjustedArray(
                 c_raw.astype(c.dtype),
-                mask,
                 c_adjs,
                 c.missing_value,
             )
+
+        for c in currency_cols:
+            codes_1d = self.raw_price_reader.currency_codes(sids)
+            codes = repeat_first_axis(codes_1d, len(dates))
+            out[c] = AdjustedArray(
+                codes,
+                adjustments={},
+                missing_value=None,
+            )
+
         return out
 
+    @property
+    def currency_aware(self):
+        # Tell the pipeline engine that this loader supports currency
+        # conversion if we have a non-dummy fx rates reader.
+        return not isinstance(self.fx_reader, ExplodingFXRateReader)
 
-def _shift_dates(dates, start_date, end_date, shift):
-    try:
-        start = dates.get_loc(start_date)
-    except KeyError:
-        if start_date < dates[0]:
-            raise NoFurtherDataError(
-                msg=(
-                    "Pipeline Query requested data starting on {query_start}, "
-                    "but first known date is {calendar_start}"
-                ).format(
-                    query_start=str(start_date),
-                    calendar_start=str(dates[0]),
-                )
+    def _inplace_currency_convert(self, columns, arrays, dates, sids):
+        """
+        Currency convert raw data loaded for ``column``.
+
+        Parameters
+        ----------
+        columns : list[zipline.pipeline.data.BoundColumn]
+            List of columns whose raw data has been loaded.
+        arrays : list[np.array]
+            List of arrays, parallel to ``columns`` containing data for the
+            column.
+        dates : pd.DatetimeIndex
+            Labels for rows of ``arrays``. These are the dates that should
+            be used to fetch fx rates for conversion.
+        sids : np.array[int64]
+            Labels for columns of ``arrays``.
+
+        Returns
+        -------
+        None
+
+        Side Effects
+        ------------
+        Modifies ``arrays`` in place by applying currency conversions.
+        """
+        # Group columns by currency conversion spec.
+        by_spec = defaultdict(list)
+        for column, array in zip(columns, arrays):
+            by_spec[column.currency_conversion].append(array)
+
+        # Nothing to do for terms with no currency conversion.
+        by_spec.pop(None, None)
+        if not by_spec:
+            return
+
+        fx_reader = self.fx_reader
+        base_currencies = self.raw_price_reader.currency_codes(sids)
+
+        # Columns with the same conversion spec will use the same multipliers.
+        for spec, arrays in by_spec.items():
+            rates = fx_reader.get_rates(
+                rate=spec.field,
+                quote=spec.currency.code,
+                bases=base_currencies,
+                dts=dates,
             )
-        else:
-            raise ValueError("Query start %s not in calendar" % start_date)
+            for arr in arrays:
+                multiply(arr, rates, out=arr)
 
-    # Make sure that shifting doesn't push us out of the calendar.
-    if start < shift:
-        raise NoFurtherDataError(
-            msg=(
-                "Pipeline Query requested data from {shift}"
-                " days before {query_start}, but first known date is only "
-                "{start} days earlier."
-            ).format(shift=shift, query_start=start_date, start=start),
-        )
+    def _split_column_types(self, columns):
+        """Split out currency columns from OHLCV columns.
 
-    try:
-        end = dates.get_loc(end_date)
-    except KeyError:
-        if end_date > dates[-1]:
-            raise NoFurtherDataError(
-                msg=(
-                    "Pipeline Query requesting data up to {query_end}, "
-                    "but last known date is {calendar_end}"
-                ).format(
-                    query_end=end_date,
-                    calendar_end=dates[-1],
-                )
-            )
-        else:
-            raise ValueError("Query end %s not in calendar" % end_date)
-    return dates[start - shift], dates[end - shift]
+        Parameters
+        ----------
+        columns : list[zipline.pipeline.data.BoundColumn]
+            Columns to be loaded by ``load_adjusted_array``.
+
+        Returns
+        -------
+        ohlcv_columns : list[zipline.pipeline.data.BoundColumn]
+            Price and volume columns from ``columns``.
+        currency_columns : list[zipline.pipeline.data.BoundColumn]
+            Currency code column from ``columns``, if present.
+        """
+        currency_name = EquityPricing.currency.name
+
+        ohlcv = []
+        currency = []
+        for c in columns:
+            if c.name == currency_name:
+                currency.append(c)
+            else:
+                ohlcv.append(c)
+
+        return ohlcv, currency
+
+
+# Backwards compat alias.
+USEquityPricingLoader = EquityPricingLoader

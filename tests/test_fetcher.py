@@ -12,20 +12,19 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-from nose_parameterized import parameterized
+from parameterized import parameterized
 
 import pandas as pd
 import numpy as np
 from mock import patch
 
-from zipline import TradingAlgorithm
 from zipline.errors import UnsupportedOrderParameters
 from zipline.sources.requests_csv import mask_requests_args
 from zipline.utils import factory
 from zipline.testing import FetcherDataPortal
 from zipline.testing.fixtures import (
     WithResponses,
-    WithSimParams,
+    WithMakeAlgo,
     ZiplineTestCase,
 )
 from .resources.fetcher_inputs.fetcher_test_data import (
@@ -43,9 +42,16 @@ from .resources.fetcher_inputs.fetcher_test_data import (
 )
 
 
+# XXX: The algorithms in this suite do way more work than they should have to.
 class FetcherTestCase(WithResponses,
-                      WithSimParams,
+                      WithMakeAlgo,
                       ZiplineTestCase):
+    START_DATE = pd.Timestamp('2006-01-03', tz='utc')
+    END_DATE = pd.Timestamp('2006-12-29', tz='utc')
+
+    SIM_PARAMS_DATA_FREQUENCY = 'daily'
+    DATA_PORTAL_USE_MINUTE_DATA = False
+    BENCHMARK_SID = None
 
     @classmethod
     def make_equity_info(cls):
@@ -55,61 +61,69 @@ class FetcherTestCase(WithResponses,
                     'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
                     'end_date': pd.Timestamp('2007-01-01', tz='UTC'),
                     'symbol': 'AAPL',
-                    'asset_type': 'equity',
                     'exchange': 'nasdaq'
                 },
                 3766: {
                     'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
                     'end_date': pd.Timestamp('2007-01-01', tz='UTC'),
                     'symbol': 'IBM',
-                    'asset_type': 'equity',
                     'exchange': 'nasdaq'
                 },
                 5061: {
                     'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
                     'end_date': pd.Timestamp('2007-01-01', tz='UTC'),
                     'symbol': 'MSFT',
-                    'asset_type': 'equity',
                     'exchange': 'nasdaq'
                 },
                 14848: {
                     'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
                     'end_date': pd.Timestamp('2007-01-01', tz='UTC'),
                     'symbol': 'YHOO',
-                    'asset_type': 'equity',
                     'exchange': 'nasdaq'
                 },
                 25317: {
                     'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
                     'end_date': pd.Timestamp('2007-01-01', tz='UTC'),
                     'symbol': 'DELL',
-                    'asset_type': 'equity',
                     'exchange': 'nasdaq'
                 },
                 13: {
                     'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
                     'end_date': pd.Timestamp('2010-01-01', tz='UTC'),
                     'symbol': 'NFLX',
-                    'asset_type': 'equity',
                     'exchange': 'nasdaq'
+                },
+                9999999: {
+                    'start_date': pd.Timestamp('2006-01-01', tz='UTC'),
+                    'end_date': pd.Timestamp('2007-01-01', tz='UTC'),
+                    'symbol': 'AAPL',
+                    'exchange': 'non_us_exchange'
                 }
             },
             orient='index',
         )
 
-    def run_algo(self, code, sim_params=None, data_frequency="daily"):
+    @classmethod
+    def make_exchanges_info(cls, *args, **kwargs):
+        return pd.DataFrame.from_records([
+            {'exchange': 'nasdaq', 'country_code': 'US'},
+            {'exchange': 'non_us_exchange', 'country_code': 'CA'},
+        ])
+
+    def run_algo(self, code, sim_params=None):
         if sim_params is None:
             sim_params = self.sim_params
 
-        test_algo = TradingAlgorithm(
+        test_algo = self.make_algo(
             script=code,
             sim_params=sim_params,
-            env=self.env,
-            data_frequency=data_frequency
+            data_portal=FetcherDataPortal(
+                self.asset_finder,
+                self.trading_calendar,
+                self.DATA_PORTAL_FIRST_TRADING_DAY
+            ),
         )
-
-        results = test_algo.run(FetcherDataPortal(self.env,
-                                                  self.trading_calendar))
+        results = test_algo.run()
 
         return results
 
@@ -128,7 +142,7 @@ class FetcherTestCase(WithResponses,
             data_frequency="minute"
         )
 
-        test_algo = TradingAlgorithm(
+        test_algo = self.make_algo(
             script="""
 from zipline.api import fetch_csv, record, sid
 
@@ -137,13 +151,10 @@ def initialize(context):
 
 def handle_data(context, data):
     record(aapl_signal=data.current(sid(24), "signal"))
-""", sim_params=sim_params, data_frequency="minute", env=self.env)
+""", sim_params=sim_params)
 
-        # manually setting data portal and getting generator because we need
-        # the minutely emission packets here.  TradingAlgorithm.run() only
-        # returns daily packets.
-        test_algo.data_portal = FetcherDataPortal(self.env,
-                                                  self.trading_calendar)
+        # manually getting generator because we need the minutely emission
+        # packets here. TradingAlgorithm.run() only returns daily packets.
         gen = test_algo.get_generator()
         perf_packets = list(gen)
 
@@ -368,7 +379,7 @@ def handle_data(context, data):
         """)
 
             np.testing.assert_array_equal([24] * 251, results["aapl"])
-            self.assertEqual(337, results["palladium"].iloc[-1])
+            self.assertEqual('337.0', results["palladium"].iloc[-1])
 
             expected = {
                 'allow_redirects': False,
@@ -395,8 +406,8 @@ def handle_data(context, data):
 
             algocode = """
 from pandas import Timestamp
-from pandas.tseries.tools import normalize_date
 from zipline.api import fetch_csv, record, sid, get_datetime
+from zipline.utils.pandas_utils import normalize_date
 
 def initialize(context):
     fetch_csv(
@@ -534,7 +545,7 @@ def handle_data(context, data):
     record(sid_count=len(actual))
     record(bar_count=context.bar_count)
     context.bar_count += 1
-        """, sim_params=sim_params, data_frequency="minute"
+        """, sim_params=sim_params,
         )
 
         self.assertEqual(3, len(results))
@@ -567,7 +578,7 @@ def initialize(context):
 
 def before_trading_start(context, data):
     record(Short_Interest = data.current(context.stock, 'dtc'))
-""", sim_params=sim_params, data_frequency="minute")
+""", sim_params=sim_params)
 
         values = results["Short_Interest"]
         np.testing.assert_array_equal(values[0:33], np.full(33, np.nan))
@@ -600,12 +611,12 @@ def initialize(context):
                date_column = 'Settlement Date',
                date_format = '%m/%d/%y')
     context.nflx = symbol('NFLX')
-    context.aapl = symbol('AAPL')
+    context.aapl = symbol('AAPL', country_code='US')
 
 def handle_data(context, data):
     assert np.isnan(data.current(context.nflx, 'invalid_column'))
     assert np.isnan(data.current(context.aapl, 'invalid_column'))
     assert np.isnan(data.current(context.aapl, 'dtc'))
-""", sim_params=sim_params, data_frequency="minute")
+""", sim_params=sim_params)
 
         self.assertEqual(3, len(results))

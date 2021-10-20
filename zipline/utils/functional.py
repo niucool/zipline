@@ -1,7 +1,8 @@
 from functools import reduce
+from operator import itemgetter
 from pprint import pformat
 
-from six import viewkeys
+from six import viewkeys, iteritems
 from six.moves import map, zip
 from toolz import curry, flip
 
@@ -74,8 +75,8 @@ def mapall(funcs, seq):
     elem : object
         Concatenated result of mapping each ``func`` over ``seq``.
 
-    Example
-    -------
+    Examples
+    --------
     >>> list(mapall([lambda x: x + 1, lambda x: x - 1], [1, 2, 3]))
     [2, 3, 4, 0, 1, 2]
     """
@@ -90,8 +91,8 @@ def same(*values):
 
     Returns True on empty sequences.
 
-    Example
-    -------
+    Examples
+    --------
     >>> same(1, 1, 1, 1)
     True
     >>> same(1, 2, 1)
@@ -128,8 +129,8 @@ def dzip_exact(*dicts):
     ValueError
         If dicts don't all have the same keys.
 
-    Example
-    -------
+    Examples
+    --------
     >>> result = dzip_exact({'a': 1, 'b': 2}, {'a': 3, 'b': 4})
     >>> result == {'a': (1, 3), 'b': (2, 4)}
     True
@@ -160,7 +161,11 @@ def _gen_unzip(it, elem_len):
     ValueError
         Raised when the lengths do not match the ``elem_len``.
     """
-    elem = next(it)
+    try:
+        elem = next(it)
+    except:
+        # in python 3.7 this raises a RuntimeError: generator raised StopIteration
+        return
     first_elem_len = len(elem)
 
     if elem_len is not None and elem_len != first_elem_len:
@@ -273,8 +278,8 @@ def getattrs(value, attrs, default=_no_default):
     result : object
         Result of the lookup sequence.
 
-    Example
-    -------
+    Examples
+    --------
     >>> class EmptyObject(object):
     ...     pass
     ...
@@ -309,8 +314,8 @@ def set_attribute(name, value):
 
     Doesn't change the behavior of the wrapped function.
 
-    Usage
-    -----
+    Examples
+    --------
     >>> @set_attribute('__name__', 'foo')
     ... def bar():
     ...     return 3
@@ -390,3 +395,30 @@ def foldr(f, seq, default=_no_default):
         reversed(seq),
         *(default,) if default is not _no_default else ()
     )
+
+
+def invert(d):
+    """
+    Invert a dictionary into a dictionary of sets.
+
+    >>> invert({'a': 1, 'b': 2, 'c': 1})  # doctest: +SKIP
+    {1: {'a', 'c'}, 2: {'b'}}
+    """
+    out = {}
+    for k, v in iteritems(d):
+        try:
+            out[v].add(k)
+        except KeyError:
+            out[v] = {k}
+    return out
+
+
+def keysorted(d):
+    """Get the items from a dict, sorted by key.
+
+    Example
+    -------
+    >>> keysorted({'c': 1, 'b': 2, 'a': 3})
+    [('a', 3), ('b', 2), ('c', 1)]
+    """
+    return sorted(iteritems(d), key=itemgetter(0))

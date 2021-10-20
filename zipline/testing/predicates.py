@@ -1,7 +1,7 @@
+from collections import OrderedDict
 from contextlib import contextmanager
 import datetime
 from functools import partial
-import inspect
 import re
 
 from nose.tools import (  # noqa
@@ -34,22 +34,29 @@ from nose.tools import (  # noqa
 )
 import numpy as np
 import pandas as pd
-from pandas.util.testing import (
+from pandas.testing import (
     assert_frame_equal,
-    assert_panel_equal,
     assert_series_equal,
     assert_index_equal,
 )
 from six import iteritems, viewkeys, PY2
+from six.moves import zip_longest
 from toolz import dissoc, keyfilter
 import toolz.curried.operator as op
 
-from zipline.testing.core import ensure_doctest
+from zipline.assets import Asset
 from zipline.dispatch import dispatch
 from zipline.lib.adjustment import Adjustment
 from zipline.lib.labelarray import LabelArray
+from zipline.testing.core import ensure_doctest
+from zipline.utils.compat import getargspec, mappingproxy
+from zipline.utils.formatting import s
 from zipline.utils.functional import dzip_exact, instance
 from zipline.utils.math_utils import tolerant_equals
+from zipline.utils.numpy_utils import (
+    assert_array_compare,
+    compare_datetime_arrays,
+)
 
 
 @instance
@@ -83,7 +90,49 @@ class wildcard(object):
 
     def __repr__(self):
         return '<%s>' % type(self).__name__
-    __str__ = __repr__
+
+
+class instance_of(object):
+    """An object that compares equal to any instance of a given type or types.
+
+    Parameters
+    ----------
+    types : type or tuple[type]
+        The types to compare equal to.
+    exact : bool, optional
+        Only compare equal to exact instances, not instances of subclasses?
+    """
+    def __init__(self, types, exact=False):
+        if not isinstance(types, tuple):
+            types = (types,)
+
+        for type_ in types:
+            if not isinstance(type_, type):
+                raise TypeError('types must be a type or tuple of types')
+
+        self.types = types
+        self.exact = exact
+
+    def __eq__(self, other):
+        if self.exact:
+            return type(other) in self.types
+
+        return isinstance(other, self.types)
+
+    def __ne__(self, other):
+        return not self == other
+
+    def __repr__(self):
+        typenames = tuple(t.__name__ for t in self.types)
+        return '%s(%s%s)' % (
+            type(self).__name__,
+            (
+                typenames[0]
+                if len(typenames) == 1 else
+                '(%s)' % ', '.join(typenames)
+            ),
+            ', exact=True' if self.exact else ''
+        )
 
 
 def keywords(func):
@@ -103,7 +152,7 @@ def keywords(func):
         return keywords(func.__init__)
     elif isinstance(func, partial):
         return keywords(func.func)
-    return inspect.getargspec(func).args
+    return getargspec(func).args
 
 
 def filter_kwargs(f, kwargs):
@@ -128,25 +177,6 @@ def filter_kwargs(f, kwargs):
     Taken from odo.utils
     """
     return keyfilter(op.contains(keywords(f)), kwargs)
-
-
-def _s(word, seq, suffix='s'):
-    """Adds a suffix to ``word`` if some sequence has anything other than
-    exactly one element.
-
-    word : str
-        The string to add the suffix to.
-    seq : sequence
-        The sequence to check the length of.
-    suffix : str, optional.
-        The suffix to add to ``word``
-
-    Returns
-    -------
-    maybe_plural : str
-        ``word`` with ``suffix`` added if ``len(seq) != 1``.
-    """
-    return word + (suffix if len(seq) != 1 else '')
 
 
 def _fmt_path(path):
@@ -213,6 +243,27 @@ def assert_is_subclass(subcls, cls, msg=''):
     )
 
 
+def assert_is_not_subclass(not_subcls, cls, msg=''):
+    """Assert that ``not_subcls`` is not a subclass of ``cls``.
+
+    Parameters
+    ----------
+    not_subcls : type
+        The type to check.
+    cls : type
+        The type to check ``not_subcls`` against.
+    msg : str, optional
+        An extra assertion message to print if this fails.
+    """
+    assert not issubclass(not_subcls, cls), (
+        '%s is a subclass of %s\n%s' % (
+            _safe_cls_name(not_subcls),
+            _safe_cls_name(cls),
+            msg,
+        )
+    )
+
+
 def assert_regex(result, expected, msg=''):
     """Assert that ``expected`` matches the result.
 
@@ -231,6 +282,15 @@ def assert_regex(result, expected, msg=''):
 
 
 @contextmanager
+def _assert_raises_helper(do_check, exc_type, msg):
+    try:
+        yield
+    except exc_type as e:
+        do_check(e)
+    else:
+        raise AssertionError('%s%s was not raised' % (_fmt_msg(msg), exc_type))
+
+
 def assert_raises_regex(exc, pattern, msg=''):
     """Assert that some exception is raised in a context and that the message
     matches some pattern.
@@ -244,14 +304,70 @@ def assert_raises_regex(exc, pattern, msg=''):
     msg : str, optional
         An extra assertion message to print if this fails.
     """
-    try:
-        yield
-    except exc as e:
+    def check_exception(e):
         assert re.search(pattern, str(e)), (
             '%s%r not found in %r' % (_fmt_msg(msg), pattern, str(e))
         )
-    else:
-        raise AssertionError('%s%s was not raised' % (_fmt_msg(msg), exc))
+
+    return _assert_raises_helper(
+        do_check=check_exception,
+        exc_type=exc,
+        msg=msg,
+    )
+
+
+def assert_raises_str(exc, expected_str, msg=''):
+    """Assert that some exception is raised in a context and that the message
+    exactly matches some string.
+
+    Parameters
+    ----------
+    exc : type or tuple[type]
+        The exception type or types to expect.
+    expected_str : str
+        The expected result of ``str(exception)``.
+    msg : str, optional
+        An extra assertion message to print if this fails.
+    """
+    def check_exception(e):
+        result = str(e)
+        assert_messages_equal(result, expected_str, msg=msg)
+
+    return _assert_raises_helper(
+        check_exception,
+        exc_type=exc,
+        msg=msg,
+    )
+
+
+def make_assert_equal_assertion_error(assertion_message, path, msg):
+    """Create an assertion error formatted for use in ``assert_equal``.
+
+    Parameters
+    ----------
+    assertion_message : str
+        The concrete reason for the failure.
+    path : tuple[str]
+        The path leading up to the failure.
+    msg : str
+        The user supplied message.
+
+    Returns
+    -------
+    exception_instance : AssertionError
+        The new exception instance.
+
+    Notes
+    -----
+    This doesn't raise the exception, it only returns it.
+    """
+    return AssertionError(
+        '%s%s\n%s' % (
+            _fmt_msg(msg),
+            assertion_message,
+            _fmt_path(path),
+        ),
+    )
 
 
 @dispatch(object, object)
@@ -270,12 +386,12 @@ def assert_equal(result, expected, path=(), msg='', **kwargs):
     AssertionError
         Raised when ``result`` is not equal to ``expected``.
     """
-    assert result == expected, '%s%s != %s\n%s' % (
-        _fmt_msg(msg),
-        result,
-        expected,
-        _fmt_path(path),
-    )
+    if result != expected:
+        raise make_assert_equal_assertion_error(
+            '%s != %s' % (result, expected),
+            path,
+            msg,
+        )
 
 
 @assert_equal.register(float, float)
@@ -320,23 +436,23 @@ def _check_sets(result, expected, msg, path, type_):
     if result != expected:
         if result > expected:
             diff = result - expected
-            msg = 'extra %s in result: %r' % (_s(type_, diff), diff)
+            msg = 'extra %s in result: %r' % (s(type_, diff), diff)
         elif result < expected:
             diff = expected - result
-            msg = 'result is missing %s: %r' % (_s(type_, diff), diff)
+            msg = 'result is missing %s: %r' % (s(type_, diff), diff)
         else:
             in_result = result - expected
             in_expected = expected - result
             msg = '%s only in result: %s\n%s only in expected: %s' % (
-                _s(type_, in_result),
+                s(type_, in_result),
                 in_result,
-                _s(type_, in_expected),
+                s(type_, in_expected),
                 in_expected,
             )
         raise AssertionError(
-            '%s%ss do not match\n%s' % (
-                _fmt_msg(msg),
+            '%ss do not match\n%s%s' % (
                 type_,
+                _fmt_msg(msg),
                 _fmt_path(path),
             ),
         )
@@ -358,7 +474,38 @@ def assert_dict_equal(result, expected, path=(), msg='', **kwargs):
             assert_equal(
                 resultv,
                 expectedv,
-                path=path + ('[%r]' % k,),
+                path=path + ('[%r]' % (k,),),
+                msg=msg,
+                **kwargs
+            )
+        except AssertionError as e:
+            failures.append(str(e))
+
+    if failures:
+        raise AssertionError('\n===\n'.join(failures))
+
+
+@assert_equal.register(mappingproxy, mappingproxy)
+def asssert_mappingproxy_equal(result, expected, path=(), msg='', **kwargs):
+    # mappingproxies compare like dict but shouldn't compare to dicts
+    _check_sets(
+        set(result),
+        set(expected),
+        msg,
+        path + ('.keys()',),
+        'key',
+    )
+
+    failures = []
+    for k, resultv in iteritems(result):
+        # we know this exists because of the _check_sets call above
+        expectedv = expected[k]
+
+        try:
+            assert_equal(
+                resultv,
+                expectedv,
+                path=path + ('[%r]' % (k,),),
                 msg=msg,
                 **kwargs
             )
@@ -367,6 +514,16 @@ def assert_dict_equal(result, expected, path=(), msg='', **kwargs):
 
     if failures:
         raise AssertionError('\n'.join(failures))
+
+
+@assert_equal.register(OrderedDict, OrderedDict)
+def assert_ordereddict_equal(result, expected, path=(), **kwargs):
+    assert_sequence_equal(
+        result.items(),
+        expected.items(),
+        path=path + ('.items()',),
+        **kwargs
+    )
 
 
 @assert_equal.register(list, list)
@@ -412,11 +569,30 @@ def assert_array_equal(result,
                        array_verbose=True,
                        array_decimal=None,
                        **kwargs):
-    f = (
-        np.testing.assert_array_equal
-        if array_decimal is None else
-        partial(np.testing.assert_array_almost_equal, decimal=array_decimal)
-    )
+    result_dtype = result.dtype
+    expected_dtype = expected.dtype
+
+    if result_dtype.kind in 'mM' and expected_dtype.kind in 'mM':
+        assert result_dtype == expected_dtype, (
+            "\nType mismatch:\n\n"
+            "result dtype: %s\n"
+            "expected dtype: %s\n%s"
+            % (result_dtype, expected_dtype, _fmt_path(path))
+        )
+
+        f = partial(
+            assert_array_compare,
+            compare_datetime_arrays,
+            header='Arrays are not equal',
+        )
+    elif array_decimal is not None and expected_dtype.kind not in {'O', 'S'}:
+        f = partial(
+            np.testing.assert_array_almost_equal,
+            decimal=array_decimal,
+        )
+    else:
+        f = np.testing.assert_array_equal
+
     try:
         f(
             result,
@@ -481,7 +657,7 @@ assert_frame_equal = _register_assert_equal_wrapper(
 )
 assert_panel_equal = _register_assert_equal_wrapper(
     pd.Panel,
-    assert_panel_equal,
+    assert_frame_equal,
 )
 assert_series_equal = _register_assert_equal_wrapper(
     pd.Series,
@@ -549,8 +725,17 @@ def assert_timestamp_and_datetime_equal(result,
         )
     )
 
+    if isinstance(result, pd.Timestamp) and isinstance(expected, pd.Timestamp):
+        assert_equal(
+            result.tz,
+            expected.tz,
+            path=path + ('.tz',),
+            msg=msg,
+            **kwargs
+        )
+
     result = pd.Timestamp(result)
-    expected = pd.Timestamp(result)
+    expected = pd.Timestamp(expected)
     if compare_nat_equal and pd.isnull(result) and pd.isnull(expected):
         return
 
@@ -558,6 +743,7 @@ def assert_timestamp_and_datetime_equal(result,
         result,
         expected,
         path=path,
+        msg=msg,
         **kwargs
     )
 
@@ -588,10 +774,60 @@ def assert_slice_equal(result, expected, path=(), msg=''):
     )
 
 
+@assert_equal.register(Asset, Asset)
+def assert_asset_equal(result, expected, path=(), msg='', **kwargs):
+    if type(result) is not type(expected):
+        raise AssertionError(
+            '%sresult type differs from expected type: %s is not %s\n%s',
+            _fmt_msg(msg),
+            type(result).__name__,
+            type(expected).__name__,
+            _fmt_path(path),
+        )
+
+    assert_equal(
+        result.to_dict(),
+        expected.to_dict(),
+        path=path + ('.to_dict()',),
+        msg=msg,
+        **kwargs
+    )
+
+
 def assert_isidentical(result, expected, msg=''):
     assert result.isidentical(expected), (
         '%s%s is not identical to %s' % (_fmt_msg(msg), result, expected)
     )
+
+
+def assert_messages_equal(result, expected, msg=''):
+    """Assertion helper for comparing very long strings (e.g. error messages).
+    """
+    # The arg here is "keepends" which keeps trailing newlines (which
+    # matters for checking trailing whitespace). You can't pass keepends by
+    # name :(.
+    left_lines = result.splitlines(True)
+    right_lines = expected.splitlines(True)
+    iter_lines = enumerate(zip_longest(left_lines, right_lines))
+    for line, (ll, rl) in iter_lines:
+        if ll != rl:
+            col = index_of_first_difference(ll, rl)
+            raise AssertionError(
+                "{msg}Messages differ on line {line}, col {col}:"
+                "\n{ll!r}\n!=\n{rl!r}".format(
+                    msg=_fmt_msg(msg), line=line, col=col, ll=ll, rl=rl
+                )
+            )
+
+
+def index_of_first_difference(left, right):
+    """Get the index of the first difference between two strings."""
+    difflocs = (i for (i, (lc, rc)) in enumerate(zip_longest(left, right))
+                if lc != rc)
+    try:
+        return next(difflocs)
+    except StopIteration:
+        raise ValueError("Left was equal to right!")
 
 
 try:

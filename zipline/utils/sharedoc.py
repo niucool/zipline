@@ -5,6 +5,7 @@ across different functions.
 import re
 from six import iteritems
 from textwrap import dedent
+from toolz import curry
 
 PIPELINE_DOWNSAMPLING_FREQUENCY_DOC = dedent(
     """\
@@ -54,7 +55,7 @@ def format_docstring(owner_name, docstring, formatters):
     format_params = {}
     for target, doc_for_target in iteritems(formatters):
         # Search for '{name}', with optional leading whitespace.
-        regex = re.compile('^(\s*)' + '({' + target + '})$', re.MULTILINE)
+        regex = re.compile(r'^(\s*)' + '({' + target + '})$', re.MULTILINE)
         matches = regex.findall(docstring)
         if not matches:
             raise ValueError(
@@ -85,8 +86,8 @@ def templated_docstring(**docs):
     """
     Decorator allowing the use of templated docstrings.
 
-    Usage
-    -----
+    Examples
+    --------
     >>> @templated_docstring(foo='bar')
     ... def my_func(self, foo):
     ...     '''{foo}'''
@@ -98,3 +99,21 @@ def templated_docstring(**docs):
         f.__doc__ = format_docstring(f.__name__, f.__doc__, docs)
         return f
     return decorator
+
+
+@curry
+def copydoc(from_, to):
+    """Copies the docstring from one function to another.
+    Parameters
+    ----------
+    from_ : any
+        The object to copy the docstring from.
+    to : any
+        The object to copy the docstring to.
+    Returns
+    -------
+    to : any
+        ``to`` with the docstring from ``from_``
+    """
+    to.__doc__ = from_.__doc__
+    return to

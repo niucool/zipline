@@ -49,6 +49,9 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
         self._trading_calendar = trading_calendar
         self._asset_finder = asset_finder
         self._readers = readers
+        # if no timezone given, assume utf
+        if last_available_dt and not last_available_dt.tzinfo:
+            last_available_dt = last_available_dt.tz_localize('utc')
         self._last_available_dt = last_available_dt
 
         for t, r in iteritems(self._readers):
@@ -85,11 +88,11 @@ class AssetDispatchBarReader(with_metaclass(ABCMeta)):
         if self._last_available_dt is not None:
             return self._last_available_dt
         else:
-            return min(r.last_available_dt for r in self._readers.values())
+            return max(r.last_available_dt for r in self._readers.values())
 
     @lazyval
     def first_trading_day(self):
-        return max(r.first_trading_day for r in self._readers.values())
+        return min(r.first_trading_day for r in self._readers.values())
 
     def get_value(self, sid, dt, field):
         asset = self._asset_finder.retrieve_asset(sid)

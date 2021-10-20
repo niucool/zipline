@@ -10,7 +10,9 @@ from pandas import (
     DataFrame,
     DatetimeIndex,
     Int64Index,
+    date_range
 )
+from trading_calendars import get_calendar
 
 from zipline.lib.adjustment import (
     ADD,
@@ -21,10 +23,8 @@ from zipline.lib.adjustment import (
     OVERWRITE,
 )
 from zipline.pipeline.data import USEquityPricing
-from zipline.pipeline.loaders.frame import (
-    DataFrameLoader,
-)
-from zipline.utils.calendars import get_calendar
+from zipline.pipeline.domain import US_EQUITIES
+from zipline.pipeline.loaders.frame import DataFrameLoader
 
 
 class DataFrameLoaderTestCase(TestCase):
@@ -36,7 +36,7 @@ class DataFrameLoaderTestCase(TestCase):
         self.ndates = 20
 
         self.sids = Int64Index(range(self.nsids))
-        self.dates = DatetimeIndex(
+        self.dates = date_range(
             start='2014-01-02',
             freq=self.trading_day,
             periods=self.ndates,
@@ -58,12 +58,17 @@ class DataFrameLoaderTestCase(TestCase):
         with self.assertRaises(ValueError):
             # Wrong column.
             loader.load_adjusted_array(
-                [USEquityPricing.open], self.dates, self.sids, self.mask
+                US_EQUITIES,
+                [USEquityPricing.open],
+                self.dates,
+                self.sids,
+                self.mask,
             )
 
         with self.assertRaises(ValueError):
             # Too many columns.
             loader.load_adjusted_array(
+                US_EQUITIES,
                 [USEquityPricing.open, USEquityPricing.close],
                 self.dates,
                 self.sids,
@@ -78,6 +83,7 @@ class DataFrameLoaderTestCase(TestCase):
         dates_slice = slice(None, 10, None)
         sids_slice = slice(1, 3, None)
         [adj_array] = loader.load_adjusted_array(
+            US_EQUITIES,
             [USEquityPricing.close],
             self.dates[dates_slice],
             self.sids[sids_slice],
@@ -230,9 +236,10 @@ class DataFrameLoaderTestCase(TestCase):
         mask = self.mask[dates_slice, sids_slice]
         with patch('zipline.pipeline.loaders.frame.AdjustedArray') as m:
             loader.load_adjusted_array(
+                US_EQUITIES,
                 columns=[USEquityPricing.close],
                 dates=self.dates[dates_slice],
-                assets=self.sids[sids_slice],
+                sids=self.sids[sids_slice],
                 mask=mask,
             )
 
@@ -240,5 +247,4 @@ class DataFrameLoaderTestCase(TestCase):
 
         args, kwargs = m.call_args
         assert_array_equal(kwargs['data'], expected_baseline.values)
-        assert_array_equal(kwargs['mask'], mask)
         self.assertEqual(kwargs['adjustments'], expected_formatted_adjustments)

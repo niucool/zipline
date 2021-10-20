@@ -4,90 +4,119 @@ import os
 import shutil
 import warnings
 
-from contextlib2 import ExitStack
 import click
+from logbook import Logger
 import pandas as pd
+from trading_calendars import get_calendar
 from toolz import curry, complement, take
 
-from ..us_equity_pricing import (
-    BcolzDailyBarReader,
-    BcolzDailyBarWriter,
-    SQLiteAdjustmentReader,
-    SQLiteAdjustmentWriter,
-)
+from ..adjustments import SQLiteAdjustmentReader, SQLiteAdjustmentWriter
+from ..bcolz_daily_bars import BcolzDailyBarReader, BcolzDailyBarWriter
 from ..minute_bars import (
     BcolzMinuteBarReader,
     BcolzMinuteBarWriter,
 )
-from zipline.assets import AssetDBWriter, AssetFinder, ASSET_DB_VERSION
+from ..psql_daily_bars import PSQLDailyBarReader, PSQLDailyBarWriter
+from zipline.assets import (
+    AssetDBWriter,
+    AssetFinder,
+    ASSET_DB_VERSION,
+)
+
 from zipline.assets.asset_db_migrations import downgrade
 from zipline.utils.cache import (
     dataframe_cache,
     working_dir,
     working_file,
 )
-from zipline.utils.compat import mappingproxy
+from zipline.utils.compat import ExitStack, mappingproxy
 from zipline.utils.input_validation import ensure_timestamp, optionally
 import zipline.utils.paths as pth
 from zipline.utils.preprocess import preprocess
-from zipline.utils.calendars import get_calendar
+
+from sqlalchemy.exc import InvalidRequestError
+
+log = Logger(__name__)
 
 
 def asset_db_path(bundle_name, timestr, environ=None, db_version=None):
     return pth.data_path(
-        asset_db_relative(bundle_name, timestr, environ, db_version),
+        asset_db_relative(bundle_name, timestr, db_version),
         environ=environ,
     )
 
 
 def minute_equity_path(bundle_name, timestr, environ=None):
     return pth.data_path(
-        minute_equity_relative(bundle_name, timestr, environ),
+        minute_equity_relative(bundle_name, timestr),
         environ=environ,
     )
 
 
 def daily_equity_path(bundle_name, timestr, environ=None):
     return pth.data_path(
-        daily_equity_relative(bundle_name, timestr, environ),
+        daily_equity_relative(bundle_name, timestr),
         environ=environ,
     )
 
 
 def adjustment_db_path(bundle_name, timestr, environ=None):
     return pth.data_path(
-        adjustment_db_relative(bundle_name, timestr, environ),
+        adjustment_db_relative(bundle_name, timestr),
         environ=environ,
     )
 
 
 def cache_path(bundle_name, environ=None):
     return pth.data_path(
-        cache_relative(bundle_name, environ),
+        cache_relative(bundle_name),
         environ=environ,
     )
 
 
-def adjustment_db_relative(bundle_name, timestr, environ=None):
+def adjustment_db_relative(bundle_name, timestr):
     return bundle_name, timestr, 'adjustments.sqlite'
 
 
-def cache_relative(bundle_name, timestr, environ=None):
+def cache_relative(bundle_name):
     return bundle_name, '.cache'
 
 
-def daily_equity_relative(bundle_name, timestr, environ=None):
+def daily_equity_relative(bundle_name, timestr):
     return bundle_name, timestr, 'daily_equities.bcolz'
 
 
-def minute_equity_relative(bundle_name, timestr, environ=None):
+def minute_equity_relative(bundle_name, timestr):
     return bundle_name, timestr, 'minute_equities.bcolz'
 
 
-def asset_db_relative(bundle_name, timestr, environ=None, db_version=None):
+def asset_db_relative(bundle_name, timestr, db_version=None):
     db_version = ASSET_DB_VERSION if db_version is None else db_version
 
     return bundle_name, timestr, 'assets-%d.sqlite' % db_version
+
+
+def external_db_path(bundle_name, environ):
+    import zipline.config.data_backend
+    path = None
+    if zipline.config.data_backend.db_backend_configured():
+        if zipline.config.data_backend.db_backend_configured() == 'postgres':
+            db = zipline.config.data_backend.PostgresDB()
+            host = db.host
+            port = db.port
+            user = db.user
+            password = db.password
+
+            user_pwd_str = f'{user}:{password}@' if user != '' else ''
+            host_port_str = f'{host}:{port}' if port != '' else f'{host}'
+
+            # we assume bundle-name as database-name
+            path = f'postgresql://{user_pwd_str}{host_port_str}/{bundle_name}'
+        else:
+            backend = environ['ZIPLINE_DATA_BACKEND']
+            raise Exception(f'Backend {backend} currently not supported')
+
+    return path
 
 
 def to_bundle_ingest_dirname(ts):
@@ -124,6 +153,7 @@ def from_bundle_ingest_dirname(cs):
 
 
 def ingestions_for_bundle(bundle, environ=None):
+    print(os.listdir(pth.data_path([bundle], environ)))
     return sorted(
         (from_bundle_ingest_dirname(ing)
          for ing in os.listdir(pth.data_path([bundle], environ))
@@ -182,10 +212,12 @@ class BadClean(click.ClickException, ValueError):
     --------
     clean
     """
+
     def __init__(self, before, after, keep_last):
         super(BadClean, self).__init__(
-            'Cannot pass a combination of `before` and `after` with'
-            '`keep_last`. Got: before=%r, after=%r, keep_n=%r\n' % (
+            'Cannot pass a combination of `before` and `after` with '
+            '`keep_last`. Must pass one. '
+            'Got: before=%r, after=%r, keep_last=%r\n' % (
                 before,
                 after,
                 keep_last,
@@ -248,7 +280,7 @@ def _make_bundle_core():
                   The daily bar writer to write into.
               adjustment_writer : SQLiteAdjustmentWriter
                   The adjustment db writer to write into.
-              calendar : zipline.utils.calendars.TradingCalendar
+              calendar : trading_calendars.TradingCalendar
                   The trading calendar to ingest for.
               start_session : pd.Timestamp
                   The first session of data to ingest.
@@ -378,53 +410,82 @@ def _make_bundle_core():
 
         timestr = to_bundle_ingest_dirname(timestamp)
         cachepath = cache_path(name, environ=environ)
-        pth.ensure_directory(pth.data_path([name, timestr], environ=environ))
         pth.ensure_directory(cachepath)
+
+        # depending on the environment we might want to get a path to
+        # an external postgres-db instead of one to a local sqlite-db
+        # also, we need an asset-finder in case we have an external db
+        # to make it possible to get ids for asset-symbols
+        db_path_external = external_db_path(name, environ)
+
+        # needs to be checkout outside of 'with' in case create_writers is false
+        # only 'sqlite-bcolz'-backend needs to ensure local folders
+        if not db_path_external:
+            pth.ensure_directory(pth.data_path([name, timestr], environ=environ))
+
         with dataframe_cache(cachepath, clean_on_failure=False) as cache, \
                 ExitStack() as stack:
             # we use `cleanup_on_failure=False` so that we don't purge the
             # cache directory if the load fails in the middle
             if bundle.create_writers:
+
                 wd = stack.enter_context(working_dir(
                     pth.data_path([], environ=environ))
                 )
-                daily_bars_path = wd.ensure_dir(
-                    *daily_equity_relative(
-                        name, timestr, environ=environ,
+
+                asset_finder = None
+
+                if db_path_external:
+                    assets_db_path = adjustments_db_path = daily_bar_writer = db_path_external
+                    daily_bar_writer = PSQLDailyBarWriter(
+                        db_path_external,
+                        calendar,
+                        start_session,
+                        end_session,
                     )
-                )
-                daily_bar_writer = BcolzDailyBarWriter(
-                    daily_bars_path,
-                    calendar,
-                    start_session,
-                    end_session,
-                )
+                    daily_bar_reader = PSQLDailyBarReader(db_path_external)
+                    minute_bar_writer = None
+                    try:
+                        asset_finder = AssetFinder(db_path_external)
+                    except InvalidRequestError:
+                        asset_finder = None
+
+
+                else:
+                    pth.ensure_directory(pth.data_path([name, timestr], environ=environ))
+                    assets_db_path = wd.getpath(*asset_db_relative(name, timestr))
+                    adjustments_db_path = adjustment_db_path(name, timestr)
+                    adjustments_db_path = wd.getpath(*adjustment_db_relative(name, timestr))
+                    daily_bars_path = wd.ensure_dir(
+                        *daily_equity_relative(name, timestr)
+                    )
+                    daily_bar_writer = BcolzDailyBarWriter(
+                        daily_bars_path,
+                        calendar,
+                        start_session,
+                        end_session,
+                    )
+                    daily_bar_reader = BcolzDailyBarReader(daily_bars_path)
+                    minute_bar_writer = BcolzMinuteBarWriter(
+                        wd.ensure_dir(*minute_equity_relative(name, timestr)),
+                        calendar,
+                        start_session,
+                        end_session,
+                        minutes_per_day=bundle.minutes_per_day,
+                    )
+
                 # Do an empty write to ensure that the daily ctables exist
                 # when we create the SQLiteAdjustmentWriter below. The
                 # SQLiteAdjustmentWriter needs to open the daily ctables so
                 # that it can compute the adjustment ratios for the dividends.
-
                 daily_bar_writer.write(())
-                minute_bar_writer = BcolzMinuteBarWriter(
-                    wd.ensure_dir(*minute_equity_relative(
-                        name, timestr, environ=environ)
-                    ),
-                    calendar,
-                    start_session,
-                    end_session,
-                    minutes_per_day=bundle.minutes_per_day,
-                )
-                assets_db_path = wd.getpath(*asset_db_relative(
-                    name, timestr, environ=environ,
-                ))
-                asset_db_writer = AssetDBWriter(assets_db_path)
+
+                asset_db_writer = AssetDBWriter(assets_db_path, asset_finder)
 
                 adjustment_db_writer = stack.enter_context(
                     SQLiteAdjustmentWriter(
-                        wd.getpath(*adjustment_db_relative(
-                            name, timestr, environ=environ)),
-                        BcolzDailyBarReader(daily_bars_path),
-                        calendar.all_sessions,
+                        adjustments_db_path,
+                        daily_bar_reader,
                         overwrite=True,
                     )
                 )
@@ -437,6 +498,7 @@ def _make_bundle_core():
                     raise ValueError('Need to ingest a bundle that creates '
                                      'writers in order to downgrade the assets'
                                      ' db.')
+            log.info("Ingesting {}.", name)
             bundle.ingest(
                 environ,
                 asset_db_writer,
@@ -453,7 +515,7 @@ def _make_bundle_core():
 
             for version in sorted(set(assets_versions), reverse=True):
                 version_path = wd.getpath(*asset_db_relative(
-                    name, timestr, environ=environ, db_version=version,
+                    name, timestr, db_version=version,
                 ))
                 with working_file(version_path) as wf:
                     shutil.copy2(assets_db_path, wf.path)
@@ -518,19 +580,30 @@ def _make_bundle_core():
         """
         if timestamp is None:
             timestamp = pd.Timestamp.utcnow()
-        timestr = most_recent_data(name, timestamp, environ=environ)
+
+        db_path_external = external_db_path(name, environ)
+        if db_path_external:
+            assets_db_path = db_path_external
+            adjustments_db_path = db_path_external
+            # assets_db_path = asset_db_path(name, timestr, environ=environ)
+            # adjustments_db_path = adjustment_db_path(name, timestr, environ=environ)
+            daily_bar_reader = PSQLDailyBarReader(db_path_external)
+            minute_bar_reader = None
+        else:
+            timestr = most_recent_data(name, timestamp, environ=environ)
+            assets_db_path = asset_db_path(name, timestr, environ=environ)
+            adjustments_db_path = adjustment_db_path(name, timestr, environ=environ)
+            daily_bar_reader = BcolzDailyBarReader(daily_equity_path(name, timestr, environ=environ))
+            minute_bar_reader = BcolzMinuteBarReader(minute_equity_path(name, timestr, environ=environ))
+
         return BundleData(
             asset_finder=AssetFinder(
-                asset_db_path(name, timestr, environ=environ),
+                assets_db_path
             ),
-            equity_minute_bar_reader=BcolzMinuteBarReader(
-                minute_equity_path(name, timestr, environ=environ),
-            ),
-            equity_daily_bar_reader=BcolzDailyBarReader(
-                daily_equity_path(name, timestr, environ=environ),
-            ),
+            equity_minute_bar_reader=minute_bar_reader,
+            equity_daily_bar_reader=daily_bar_reader,
             adjustment_reader=SQLiteAdjustmentReader(
-                adjustment_db_path(name, timestr, environ=environ),
+                adjustments_db_path
             ),
         )
 
@@ -587,6 +660,9 @@ def _make_bundle_core():
             if e.errno != errno.ENOENT:
                 raise
             raise UnknownBundle(name)
+
+        if before is after is keep_last is None:
+            raise BadClean(before, after, keep_last)
         if ((before is not None or after is not None) and
                 keep_last is not None):
             raise BadClean(before, after, keep_last)
@@ -595,8 +671,8 @@ def _make_bundle_core():
             def should_clean(name):
                 dt = from_bundle_ingest_dirname(name)
                 return (
-                    (before is not None and dt < before) or
-                    (after is not None and dt > after)
+                        (before is not None and dt < before) or
+                        (after is not None and dt > after)
                 )
 
         elif keep_last >= 0:
@@ -610,6 +686,7 @@ def _make_bundle_core():
         cleaned = set()
         for run in all_runs:
             if should_clean(run):
+                log.info("Cleaning {}.", run)
                 path = pth.data_path([name, run], environ=environ)
                 shutil.rmtree(path)
                 cleaned.add(path)

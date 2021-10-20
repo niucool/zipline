@@ -36,6 +36,8 @@ def main():
     os.chdir(HERE)
 
     try:
+        print("Cleaning docs with 'make clean'")
+        check_call(['make', 'clean'])
         print("Building docs with 'make html'")
         check_call(['make', 'html'])
 
@@ -72,6 +74,7 @@ def main():
     print()
     print("Updated documentation branch in directory %s" % ZIPLINE_ROOT)
     print("If you are happy with these changes, commit and push to gh-pages.")
+
 
 if __name__ == '__main__':
     main()

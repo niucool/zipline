@@ -23,20 +23,23 @@ from zipline.finance.constants import FUTURE_EXCHANGE_FEES_BY_SYMBOL
 from zipline.finance.shared import AllowedAssetMarker, FinancialModelMeta
 from zipline.utils.dummy import DummyMapping
 
-DEFAULT_PER_SHARE_COST = 0.0075              # 0.75 cents per share
+DEFAULT_PER_SHARE_COST = 0.001               # 0.1 cents per share
 DEFAULT_PER_CONTRACT_COST = 0.85             # $0.85 per future contract
 DEFAULT_PER_DOLLAR_COST = 0.0015             # 0.15 cents per dollar
-DEFAULT_MINIMUM_COST_PER_EQUITY_TRADE = 1.0  # $1 per trade
-DEFAULT_MINIMUM_COST_PER_FUTURE_TRADE = 1.0  # $1 per trade
+DEFAULT_MINIMUM_COST_PER_EQUITY_TRADE = 0.0  # $0 per trade
+DEFAULT_MINIMUM_COST_PER_FUTURE_TRADE = 0.0  # $0 per trade
 
 
 class CommissionModel(with_metaclass(FinancialModelMeta)):
-    """
-    Abstract commission model interface.
+    """Abstract base class for commission models.
 
     Commission models are responsible for accepting order/transaction pairs and
     calculating how much commission should be charged to an algorithm's account
     on each transaction.
+
+    To implement a new commission model, create a subclass of
+    :class:`~zipline.finance.commission.CommissionModel` and implement
+    :meth:`calculate`.
     """
 
     # Asset types that are compatible with the given model.
@@ -68,6 +71,19 @@ class CommissionModel(with_metaclass(FinancialModelMeta)):
             this order.
         """
         raise NotImplementedError('calculate')
+
+
+class NoCommission(CommissionModel):
+    """Model commissions as free.
+
+    Notes
+    -----
+    This is primarily used for testing.
+    """
+
+    @staticmethod
+    def calculate(order, transaction):
+        return 0.0
 
 
 class EquityCommissionModel(with_metaclass(AllowedAssetMarker,
@@ -112,7 +128,7 @@ def calculate_per_unit_commission(order,
         # we've already paid some commission, so figure out how much we
         # would be paying if we only counted per unit.
         per_unit_total = \
-            (order.filled * cost_per_unit) + \
+            abs(order.filled * cost_per_unit) + \
             additional_commission + \
             initial_commission
 
@@ -133,9 +149,15 @@ class PerShare(EquityCommissionModel):
     Parameters
     ----------
     cost : float, optional
-        The amount of commissions paid per share traded.
+        The amount of commissions paid per share traded. Default is one tenth
+        of a cent per share.
     min_trade_cost : float, optional
-        The minimum amount of commissions paid per trade.
+        The minimum amount of commissions paid per trade. Default is no
+        minimum.
+
+    Notes
+    -----
+    This is zipline's default commission model for equities.
     """
 
     def __init__(self,
@@ -259,6 +281,9 @@ class PerTrade(CommissionModel):
     """
     Calculates a commission for a transaction based on a per trade cost.
 
+    For orders that require multiple fills, the full commission is charged to
+    the first fill.
+
     Parameters
     ----------
     cost : float, optional
@@ -329,12 +354,13 @@ class PerFutureTrade(PerContract):
 
 class PerDollar(EquityCommissionModel):
     """
-    Calculates a commission for a transaction based on a per dollar cost.
+    Model commissions by applying a fixed cost per dollar transacted.
 
     Parameters
     ----------
-    cost : float
-        The flat amount of commissions paid per dollar of equities traded.
+    cost : float, optional
+        The flat amount of commissions paid per dollar of equities
+        traded. Default is a commission of $0.0015 per dollar transacted.
     """
     def __init__(self, cost=DEFAULT_PER_DOLLAR_COST):
         """

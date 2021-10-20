@@ -3,13 +3,16 @@ Utilities for working with numpy arrays.
 """
 from collections import OrderedDict
 from datetime import datetime
+from distutils.version import StrictVersion
 from warnings import (
     catch_warnings,
     filterwarnings,
 )
 
+import six
 import numpy as np
 from numpy import (
+    array_equal,
     broadcast,
     busday_count,
     datetime64,
@@ -26,9 +29,13 @@ from numpy import (
 from numpy.lib.stride_tricks import as_strided
 from toolz import flip
 
+numpy_version = StrictVersion(np.__version__)
+
 uint8_dtype = dtype('uint8')
 bool_dtype = dtype('bool')
 
+uint32_dtype = dtype('uint32')
+uint64_dtype = dtype('uint64')
 int64_dtype = dtype('int64')
 
 float32_dtype = dtype('float32')
@@ -45,6 +52,12 @@ categorical_dtype = object_dtype
 
 make_datetime64ns = flip(datetime64, 'ns')
 make_datetime64D = flip(datetime64, 'D')
+
+# Array compare that works across versions of numpy
+try:
+    assert_array_compare = np.testing.utils.assert_array_compare
+except AttributeError:
+    assert_array_compare = np.testing.assert_array_compare
 
 NaTmap = {
     dtype('datetime64[%s]' % unit): datetime64('NaT', unit)
@@ -321,7 +334,7 @@ def rolling_window(array, length):
 
 # Sentinel value that isn't NaT.
 _notNaT = make_datetime64D(0)
-iNaT = NaTns.view(int64_dtype)
+iNaT = int(NaTns.view(int64_dtype))
 assert iNaT == NaTD.view(int64_dtype), "iNaTns != iNaTD"
 
 
@@ -342,7 +355,26 @@ def is_missing(data, missing_value):
         return isnan(data)
     elif is_datetime(data) and isnat(missing_value):
         return isnat(data)
+    elif is_object(data) and missing_value is None:
+        # XXX: Older versions of numpy returns True/False for array ==
+        # None. Work around this by boxing None in a 1x1 array, which causes
+        # numpy to do the broadcasted comparison we want.
+        return data == np.array([missing_value])
     return (data == missing_value)
+
+
+def same(x, y):
+    """
+    Check if two scalar values are "the same".
+
+    Returns True if `x == y`, or if x and y are both NaN or both NaT.
+    """
+    if is_float(x) and isnan(x) and is_float(y) and isnan(y):
+        return True
+    elif is_datetime(x) and isnat(x) and is_datetime(y) and isnat(y):
+        return True
+    else:
+        return x == y
 
 
 def busday_count_mask_NaT(begindates, enddates, out=None):
@@ -455,7 +487,7 @@ def as_column(a):
     if a.ndim != 1:
         raise ValueError(
             "as_column expected an 1-dimensional array, "
-            "but got an array of shape %s" % a.shape
+            "but got an array of shape %s" % (a.shape,)
         )
     return a[:, None]
 
@@ -475,7 +507,7 @@ def changed_locations(a, include_first):
     -------
     >>> import numpy as np
     >>> changed_locations(np.array([0, 0, 5, 5, 1, 1]), include_first=False)
-    array([2, 4])
+    array([2, 4], dtype=int32)
 
     >>> changed_locations(np.array([0, 0, 5, 5, 1, 1]), include_first=True)
     array([0, 2, 4])
@@ -488,3 +520,20 @@ def changed_locations(a, include_first):
         return indices
 
     return hstack([[0], indices])
+
+
+def compare_datetime_arrays(x, y):
+    """
+    Compare datetime64 ndarrays, treating NaT values as equal.
+    """
+
+    return array_equal(x.view('int64'), y.view('int64'))
+
+
+def bytes_array_to_native_str_object_array(a):
+    """Convert an array of dtype S to an object array containing `str`.
+    """
+    if six.PY2:
+        return a.astype(object)
+    else:
+        return a.astype(str).astype(object)

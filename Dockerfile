@@ -19,9 +19,9 @@
 #
 # You can also run an algo using the docker exec command.  For example:
 #
-#    docker exec -it zipline zipline run -f /projects/my_algo.py --start 2015-1-1 --end 2016-1-1 /projects/result.pickle
+#    docker exec -it zipline zipline run -f /projects/my_algo.py --start 2015-1-1 --end 2016-1-1 -o /projects/result.pickle
 #
-FROM python:3.5
+FROM python:3.6.6
 
 #
 # set up environment
@@ -44,7 +44,7 @@ ENV PROJECT_DIR=/projects \
 
 RUN mkdir ${PROJECT_DIR} \
     && apt-get -y update \
-    && apt-get -y install libfreetype6-dev libpng-dev libopenblas-dev liblapack-dev gfortran \
+    && apt-get -y install libfreetype6-dev libpng-dev libopenblas-dev liblapack-dev gfortran libhdf5-dev \
     && curl -L https://downloads.sourceforge.net/project/ta-lib/ta-lib/0.4.0/ta-lib-0.4.0-src.tar.gz | tar xvz
 
 #
@@ -83,7 +83,7 @@ EXPOSE ${NOTEBOOK_PORT}
 
 ADD . /zipline
 WORKDIR /zipline
-RUN pip install -e .
+RUN pip install -e . --default-timeout=200
 
 #
 # start the jupyter server

@@ -1,10 +1,8 @@
-import datetime
-
 import numpy as np
 import pandas as pd
+from zipline.errors import NoFurtherDataError
 from zipline.pipeline.common import TS_FIELD_NAME, SID_FIELD_NAME
 from zipline.utils.numpy_utils import categorical_dtype
-from zipline.utils.pandas_utils import mask_between_time
 
 
 def is_sorted_ascending(a):
@@ -25,6 +23,7 @@ def validate_event_metadata(event_dates,
 
 
 def next_event_indexer(all_dates,
+                       data_query_cutoff,
                        all_sids,
                        event_dates,
                        event_timestamps,
@@ -40,6 +39,8 @@ def next_event_indexer(all_dates,
     ----------
     all_dates : ndarray[datetime64[ns], ndim=1]
         Row labels for the target output.
+    data_query_cutoff : pd.DatetimeIndex
+        The boundaries for the given trading sessions in ``all_dates``.
     all_sids : ndarray[int, ndim=1]
         Column labels for the target output.
     event_dates : ndarray[datetime64[ns], ndim=1]
@@ -63,7 +64,7 @@ def next_event_indexer(all_dates,
     # side='right' here ensures that we include the event date itself
     # if it's in all_dates.
     dt_ixs = all_dates.searchsorted(event_dates, side='right')
-    ts_ixs = all_dates.searchsorted(event_timestamps)
+    ts_ixs = data_query_cutoff.searchsorted(event_timestamps, side='right')
 
     # Walk backward through the events, writing the index of the event into
     # slots ranging from the event's timestamp to its asof.  This depends for
@@ -78,7 +79,7 @@ def next_event_indexer(all_dates,
     return out
 
 
-def previous_event_indexer(all_dates,
+def previous_event_indexer(data_query_cutoff_times,
                            all_sids,
                            event_dates,
                            event_timestamps,
@@ -92,6 +93,8 @@ def previous_event_indexer(all_dates,
 
     Parameters
     ----------
+    data_query_cutoff : pd.DatetimeIndex
+        The boundaries for the given trading sessions.
     all_dates : ndarray[datetime64[ns], ndim=1]
         Row labels for the target output.
     all_sids : ndarray[int, ndim=1]
@@ -111,11 +114,15 @@ def previous_event_indexer(all_dates,
         ``event_{dates,timestamps,sids}``.
     """
     validate_event_metadata(event_dates, event_timestamps, event_sids)
-    out = np.full((len(all_dates), len(all_sids)), -1, dtype=np.int64)
+    out = np.full(
+        (len(data_query_cutoff_times), len(all_sids)),
+        -1,
+        dtype=np.int64,
+    )
 
     eff_dts = np.maximum(event_dates, event_timestamps)
     sid_ixs = all_sids.searchsorted(event_sids)
-    dt_ixs = all_dates.searchsorted(eff_dts)
+    dt_ixs = data_query_cutoff_times.searchsorted(eff_dts, side='right')
 
     # Walk backwards through the events, writing the index of the event into
     # slots ranging from max(event_date, event_timestamp) to the start of the
@@ -131,165 +138,15 @@ def previous_event_indexer(all_dates,
     return out
 
 
-def normalize_data_query_time(dt, time, tz):
-    """Apply the correct time and timezone to a date.
-
-    Parameters
-    ----------
-    dt : pd.Timestamp
-        The original datetime that represents the date.
-    time : datetime.time
-        The time of day to use as the cutoff point for new data. Data points
-        that you learn about after this time will become available to your
-        algorithm on the next trading day.
-    tz : tzinfo
-        The timezone to normalize your dates to before comparing against
-        `time`.
-
-    Returns
-    -------
-    query_dt : pd.Timestamp
-        The timestamp with the correct time and date in utc.
-    """
-    # merge the correct date with the time in the given timezone then convert
-    # back to utc
-    return pd.Timestamp(
-        datetime.datetime.combine(dt.date(), time),
-        tz=tz,
-    ).tz_convert('utc')
-
-
-def normalize_data_query_bounds(lower, upper, time, tz):
-    """Adjust the first and last dates in the requested datetime index based on
-    the provided query time and tz.
-
-    lower : pd.Timestamp
-        The lower date requested.
-    upper : pd.Timestamp
-        The upper date requested.
-    time : datetime.time
-        The time of day to use as the cutoff point for new data. Data points
-        that you learn about after this time will become available to your
-        algorithm on the next trading day.
-    tz : tzinfo
-        The timezone to normalize your dates to before comparing against
-        `time`.
-    """
-    # Subtract one day to grab things that happened on the first day we are
-    # requesting. This doesn't need to be a trading day, we are only adding
-    # a lower bound to limit the amount of in memory filtering that needs
-    # to happen.
-    lower -= datetime.timedelta(days=1)
-    if time is not None:
-        return normalize_data_query_time(
-            lower,
-            time,
-            tz,
-        ), normalize_data_query_time(
-            upper,
-            time,
-            tz,
-        )
-    return lower, upper
-
-
-_midnight = datetime.time(0, 0)
-
-
-def normalize_timestamp_to_query_time(df,
-                                      time,
-                                      tz,
-                                      inplace=False,
-                                      ts_field='timestamp'):
-    """Update the timestamp field of a dataframe to normalize dates around
-    some data query time/timezone.
-
-    Parameters
-    ----------
-    df : pd.DataFrame
-        The dataframe to update. This needs a column named ``ts_field``.
-    time : datetime.time
-        The time of day to use as the cutoff point for new data. Data points
-        that you learn about after this time will become available to your
-        algorithm on the next trading day.
-    tz : tzinfo
-        The timezone to normalize your dates to before comparing against
-        `time`.
-    inplace : bool, optional
-        Update the dataframe in place.
-    ts_field : str, optional
-        The name of the timestamp field in ``df``.
-
-    Returns
-    -------
-    df : pd.DataFrame
-        The dataframe with the timestamp field normalized. If ``inplace`` is
-        true, then this will be the same object as ``df`` otherwise this will
-        be a copy.
-    """
-    if not inplace:
-        # don't mutate the dataframe in place
-        df = df.copy()
-
-    # There is a pandas bug (0.18.1) where if the timestamps in a
-    # normalized DatetimeIndex are not sorted and one calls `tz_localize(None)`
-    #  on tha DatetimeIndex, some of the dates will be shifted by an hour
-    # (similarly to the previously mentioned bug). Therefore, we must sort
-    # the df here to ensure that we get the normalize correctly.
-    df.sort_values(ts_field, inplace=True)
-    dtidx = pd.DatetimeIndex(df.loc[:, ts_field], tz='utc')
-    dtidx_local_time = dtidx.tz_convert(tz)
-    to_roll_forward = mask_between_time(
-        dtidx_local_time,
-        time,
-        _midnight,
-        include_end=False,
-    )
-    # For all of the times that are greater than our query time add 1
-    # day and truncate to the date.
-    # We normalize twice here because of a bug in pandas 0.16.1 that causes
-    # tz_localize() to shift some timestamps by an hour if they are not grouped
-    # together by DST/EST.
-    df.loc[to_roll_forward, ts_field] = (
-        dtidx_local_time[to_roll_forward] + datetime.timedelta(days=1)
-    ).normalize().tz_localize(None).tz_localize('utc').normalize()
-
-    df.loc[~to_roll_forward, ts_field] = dtidx[~to_roll_forward].normalize()
-    return df
-
-
-def check_data_query_args(data_query_time, data_query_tz):
-    """Checks the data_query_time and data_query_tz arguments for loaders
-    and raises a standard exception if one is None and the other is not.
-
-    Parameters
-    ----------
-    data_query_time : datetime.time or None
-    data_query_tz : tzinfo or None
-
-    Raises
-    ------
-    ValueError
-        Raised when only one of the arguments is None.
-    """
-    if (data_query_time is None) ^ (data_query_tz is None):
-        raise ValueError(
-            "either 'data_query_time' and 'data_query_tz' must both be"
-            " None or neither may be None (got %r, %r)" % (
-                data_query_time,
-                data_query_tz,
-            ),
-        )
-
-
 def last_in_date_group(df,
-                       dates,
+                       data_query_cutoff_times,
                        assets,
                        reindex=True,
                        have_sids=True,
                        extra_groupers=None):
     """
     Determine the last piece of information known on each date in the date
+
     index for each group. Input df MUST be sorted such that the correct last
     item is chosen from each group.
 
@@ -298,7 +155,7 @@ def last_in_date_group(df,
     df : pd.DataFrame
         The DataFrame containing the data to be grouped. Must be sorted so that
         the correct last item is chosen from each group.
-    dates : pd.DatetimeIndex
+    data_query_cutoff_times : pd.DatetimeIndex
         The dates to use for grouping and reindexing.
     assets : pd.Int64Index
         The assets that should be included in the column multiindex.
@@ -319,9 +176,10 @@ def last_in_date_group(df,
         levels of a multiindex of columns.
 
     """
-    idx = [dates[dates.searchsorted(
-        df[TS_FIELD_NAME].values.astype('datetime64[D]')
+    idx = [data_query_cutoff_times[data_query_cutoff_times.searchsorted(
+        pd.DatetimeIndex(df[TS_FIELD_NAME]),
     )]]
+
     if have_sids:
         idx += [SID_FIELD_NAME]
     if extra_groupers is None:
@@ -344,14 +202,14 @@ def last_in_date_group(df,
         if have_sids:
             cols = last_in_group.columns
             last_in_group = last_in_group.reindex(
-                index=dates,
+                index=data_query_cutoff_times,
                 columns=pd.MultiIndex.from_product(
                     tuple(cols.levels[0:len(extra_groupers) + 1]) + (assets,),
                     names=cols.names,
                 ),
             )
         else:
-            last_in_group = last_in_group.reindex(dates)
+            last_in_group = last_in_group.reindex(data_query_cutoff_times)
 
     return last_in_group
 
@@ -404,4 +262,79 @@ def ffill_across_cols(df, columns, name_map):
             # can't convert NaNs for those types.
             df[column_name] = df[
                 column_name
-            ].fillna(column.missing_value).astype(column.dtype)
+            ].fillna(column.missing_value)
+            #].fillna(column.missing_value).astype(column.dtype)
+
+
+def shift_dates(dates, start_date, end_date, shift):
+    """
+    Shift dates of a pipeline query back by ``shift`` days.
+
+    Parameters
+    ----------
+    dates : DatetimeIndex
+        All known dates.
+    start_date : pd.Timestamp
+        Start date of the pipeline query.
+    end_date : pd.Timestamp
+        End date of the pipeline query.
+    shift : int
+        The number of days to shift back the query dates.
+
+    Returns
+    -------
+    shifted : pd.DatetimeIndex
+        The range [start_date, end_date] from ``dates``, shifted backwards by
+        ``shift`` days.
+
+    Raises
+    ------
+    ValueError
+        If ``start_date`` or ``end_date`` is not in ``dates``.
+    NoFurtherDataError
+        If shifting ``start_date`` back by ``shift`` days would push it off the
+        end of ``dates``.
+    """
+    try:
+        start = dates.get_loc(start_date)
+    except KeyError:
+        if start_date < dates[0]:
+            raise NoFurtherDataError(
+                msg=(
+                    "Pipeline Query requested data starting on {query_start}, "
+                    "but first known date is {calendar_start}"
+                ).format(
+                    query_start=str(start_date),
+                    calendar_start=str(dates[0]),
+                )
+            )
+        else:
+            raise ValueError("Query start %s not in calendar" % start_date)
+
+    # Make sure that shifting doesn't push us out of the calendar.
+    if start < shift:
+        raise NoFurtherDataError(
+            msg=(
+                "Pipeline Query requested data from {shift}"
+                " days before {query_start}, but first known date is only "
+                "{start} days earlier."
+            ).format(shift=shift, query_start=start_date, start=start),
+        )
+
+    try:
+        end = dates.get_loc(end_date)
+    except KeyError:
+        if end_date > dates[-1]:
+            raise NoFurtherDataError(
+                msg=(
+                    "Pipeline Query requesting data up to {query_end}, "
+                    "but last known date is {calendar_end}"
+                ).format(
+                    query_end=end_date,
+                    calendar_end=dates[-1],
+                )
+            )
+        else:
+            raise ValueError("Query end %s not in calendar" % end_date)
+
+    return dates[start - shift:end - shift + 1]  # +1 to be inclusive

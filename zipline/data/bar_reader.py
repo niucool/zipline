@@ -30,6 +30,16 @@ class NoDataAfterDate(NoDataOnDate):
     pass
 
 
+class NoDataForSid(Exception):
+    """
+    Raised when the requested sid is missing from the pricing data.
+    """
+    pass
+
+
+OHLCV = ('open', 'high', 'low', 'close', 'volume')
+
+
 class BarReader(with_metaclass(ABCMeta, object)):
     @abstractproperty
     def data_frequency(self):
@@ -40,13 +50,13 @@ class BarReader(with_metaclass(ABCMeta, object)):
         """
         Parameters
         ----------
-        fields : list of str
+        columns : list of str
            'open', 'high', 'low', 'close', or 'volume'
-        start_dt: Timestamp
+        start_date: Timestamp
            Beginning of the window range.
-        end_dt: Timestamp
+        end_date: Timestamp
            End of the window range.
-        sids : list of int
+        assets : list of int
            The asset identifiers in the window.
 
         Returns
