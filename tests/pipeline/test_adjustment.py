@@ -1,28 +1,36 @@
-"""
-Tests for zipline.lib.adjustment
-"""
-from unittest import TestCase
-from parameterized import parameterized
+"""Tests for zipline.lib.adjustment"""
+
+import pytest
 
 from zipline.lib import adjustment as adj
 from zipline.utils.numpy_utils import make_datetime64ns
 
 
-class AdjustmentTestCase(TestCase):
+class TestAdjustment:
+    """Tests for adjustment objects and functions."""
 
-    @parameterized.expand([
-        ('add', adj.ADD),
-        ('multiply', adj.MULTIPLY),
-        ('overwrite', adj.OVERWRITE),
-    ])
-    def test_make_float_adjustment(self, name, adj_type):
+    @pytest.mark.parametrize(  # type: ignore
+        ("name", "adj_type"),
+        [
+            ("add", adj.AdjustmentKind.ADD),
+            ("multiply", adj.AdjustmentKind.MULTIPLY),
+            ("overwrite", adj.AdjustmentKind.OVERWRITE),
+        ],
+    )
+    def test_make_float_adjustment(
+        self, name: str, adj_type: adj.AdjustmentKind
+    ) -> None:
+        """Test creating float adjustments."""
         expected_types = {
-            'add': adj.Float64Add,
-            'multiply': adj.Float64Multiply,
-            'overwrite': adj.Float64Overwrite,
+            "add": adj.Float64Add,
+            "multiply": adj.Float64Multiply,
+            "overwrite": adj.Float64Overwrite,
         }
         result = adj.make_adjustment_from_indices(
-            1, 2, 3, 4,
+            1,
+            2,
+            3,
+            4,
             adjustment_kind=adj_type,
             value=0.5,
         )
@@ -33,12 +41,16 @@ class AdjustmentTestCase(TestCase):
             last_col=4,
             value=0.5,
         )
-        self.assertEqual(result, expected)
+        assert result == expected
 
-    def test_make_int_adjustment(self):
+    def test_make_int_adjustment(self) -> None:
+        """Test creating integer adjustments."""
         result = adj.make_adjustment_from_indices(
-            1, 2, 3, 4,
-            adjustment_kind=adj.OVERWRITE,
+            1,
+            2,
+            3,
+            4,
+            adjustment_kind=adj.AdjustmentKind.OVERWRITE,
             value=1,
         )
         expected = adj.Int64Overwrite(
@@ -48,13 +60,17 @@ class AdjustmentTestCase(TestCase):
             last_col=4,
             value=1,
         )
-        self.assertEqual(result, expected)
+        assert result == expected
 
-    def test_make_datetime_adjustment(self):
+    def test_make_datetime_adjustment(self) -> None:
+        """Test creating datetime adjustments."""
         overwrite_dt = make_datetime64ns(0)
         result = adj.make_adjustment_from_indices(
-            1, 2, 3, 4,
-            adjustment_kind=adj.OVERWRITE,
+            1,
+            2,
+            3,
+            4,
+            adjustment_kind=adj.AdjustmentKind.OVERWRITE,
             value=overwrite_dt,
         )
         expected = adj.Datetime64Overwrite(
@@ -64,13 +80,24 @@ class AdjustmentTestCase(TestCase):
             last_col=4,
             value=overwrite_dt,
         )
-        self.assertEqual(result, expected)
+        assert result == expected
 
-    @parameterized.expand([("some text",), ("some text".encode(),), (None,)])
-    def test_make_object_adjustment(self, value):
+    @pytest.mark.parametrize(  # type: ignore
+        "value",
+        [
+            "some text",
+            b"some text",
+            None,
+        ],
+    )
+    def test_make_object_adjustment(self, value: int) -> None:
+        """Test creating object adjustments."""
         result = adj.make_adjustment_from_indices(
-            1, 2, 3, 4,
-            adjustment_kind=adj.OVERWRITE,
+            1,
+            2,
+            3,
+            4,
+            adjustment_kind=adj.AdjustmentKind.OVERWRITE,
             value=value,
         )
 
@@ -81,22 +108,24 @@ class AdjustmentTestCase(TestCase):
             last_col=4,
             value=value,
         )
-        self.assertEqual(result, expected)
+        assert result == expected
 
-    def test_unsupported_type(self):
-        class SomeClass(object):
+    def test_unsupported_type(self) -> None:
+        """Test that unsupported types raise TypeError."""
+
+        class SomeClass:
             pass
 
-        with self.assertRaises(TypeError) as e:
+        expected_msg = (
+            f"Don't know how to make overwrite adjustments "
+            f"for values of type {SomeClass!r}."
+        )
+        with pytest.raises(TypeError, match=expected_msg):
             adj.make_adjustment_from_indices(
-                1, 2, 3, 4,
-                adjustment_kind=adj.OVERWRITE,
+                1,
+                2,
+                3,
+                4,
+                adjustment_kind=adj.AdjustmentKind.OVERWRITE,
                 value=SomeClass(),
             )
-
-        exc = e.exception
-        expected_msg = (
-            "Don't know how to make overwrite adjustments for values of type "
-            "%r." % SomeClass
-        )
-        self.assertEqual(str(exc), expected_msg)
